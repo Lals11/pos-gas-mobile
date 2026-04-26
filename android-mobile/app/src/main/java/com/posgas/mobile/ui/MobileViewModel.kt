@@ -134,7 +134,7 @@ class MobileViewModel(private val api: ApiClient) : ViewModel() {
 
     fun selectUser(user: String) {
         currentUser = user
-        syncMessage = "Usuario: $user"
+        syncMessage = if (api.isConfigured) "Conectado a API" else "Modo local"
     }
 
     fun updateForm(next: InvoiceFormState) {

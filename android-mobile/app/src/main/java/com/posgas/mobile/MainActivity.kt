@@ -55,6 +55,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.PopupProperties
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import com.posgas.mobile.data.ApiClient
@@ -67,7 +68,7 @@ import kotlinx.coroutines.launch
 import java.text.NumberFormat
 import java.util.Locale
 
-private const val MOBILE_API_URL = "https://script.google.com/macros/s/AKfycbwoaEMTvYHguawC8MLJHvuk0tGHrphq6mBHjGr4RaLVUnd37RWWZX069Qnqoz8HR08/exec"
+private const val MOBILE_API_URL = "https://script.google.com/macros/s/AKfycbwf5QVz4iphAyKY4sawG3MkOWn-PvsSVR7QMvgDfvtMQ7Ku_sLbriFFCsPK0r-p0qc/exec"
 
 private val Bg = Color(0xFF17181C)
 private val Panel = Color(0xFF1E1F24)
@@ -138,7 +139,11 @@ private fun PosGasApp(vm: MobileViewModel) {
                         title = {
                             Column {
                                 Text("Registro de Facturas", fontWeight = FontWeight.Bold)
-                                Text(vm.syncMessage, style = MaterialTheme.typography.labelSmall, color = Brand)
+                                Text(
+                                    "${vm.syncMessage} · Usuario: ${vm.currentUser.orEmpty()}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = Brand
+                                )
                             }
                         },
                         colors = TopAppBarDefaults.topAppBarColors(
@@ -535,6 +540,7 @@ private fun SupplierField(
         DropdownMenu(
             expanded = expanded && matches.isNotEmpty(),
             onDismissRequest = { expanded = false },
+            properties = PopupProperties(focusable = false),
             modifier = Modifier
                 .background(Panel3)
                 .fillMaxWidth()
