@@ -60,6 +60,7 @@ import com.posgas.mobile.data.ApiClient
 import com.posgas.mobile.ui.Invoice
 import com.posgas.mobile.ui.InvoiceFormState
 import com.posgas.mobile.ui.MobileViewModel
+import com.posgas.mobile.ui.Supplier
 import com.posgas.mobile.ui.amountInCordobas
 import kotlinx.coroutines.launch
 import java.text.NumberFormat
@@ -125,13 +126,13 @@ private fun PosGasApp(vm: MobileViewModel) {
                     TopAppBar(
                         navigationIcon = {
                             TextButton(onClick = { scope.launch { drawerState.open() } }) {
-                                Text("Menu", color = Brand, fontWeight = FontWeight.Bold)
+                                Text("☰", color = Brand, fontWeight = FontWeight.Bold)
                             }
                         },
                         title = {
                             Column {
                                 Text("Registro de Facturas", fontWeight = FontWeight.Bold)
-                                Text(vm.syncMessage, style = MaterialTheme.typography.labelSmall, color = TextSoft)
+                                Text(vm.syncMessage, style = MaterialTheme.typography.labelSmall, color = Brand)
                             }
                         },
                         colors = TopAppBarDefaults.topAppBarColors(
@@ -179,8 +180,12 @@ private fun PosGasApp(vm: MobileViewModel) {
                             isEditing = vm.isEditing,
                             saving = vm.saving,
                             cashTotal = vm.cashTotal,
+                            supplierMatches = vm.supplierMatches,
                             error = vm.error,
                             onChange = vm::updateForm,
+                            onSupplierQuery = vm::updateSupplierQuery,
+                            onSupplierSelect = vm::selectSupplier,
+                            onSupplierCreate = vm::createSupplier,
                             onSave = vm::saveInvoice,
                             onClear = vm::clearForm
                         )
@@ -309,8 +314,12 @@ private fun InvoiceForm(
     isEditing: Boolean,
     saving: Boolean,
     cashTotal: Double,
+    supplierMatches: List<Supplier>,
     error: String?,
     onChange: (InvoiceFormState) -> Unit,
+    onSupplierQuery: (String) -> Unit,
+    onSupplierSelect: (Supplier) -> Unit,
+    onSupplierCreate: () -> Unit,
     onSave: () -> Unit,
     onClear: () -> Unit
 ) {
@@ -332,7 +341,14 @@ private fun InvoiceForm(
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Field(form.establishment, "Establecimiento", { onChange(form.copy(establishment = it)) }, Modifier.weight(1f))
-                Field(form.supplier, "Proveedor", { onChange(form.copy(supplier = it)) }, Modifier.weight(1f))
+                SupplierField(
+                    value = form.supplier,
+                    matches = supplierMatches,
+                    onValueChange = onSupplierQuery,
+                    onSelect = onSupplierSelect,
+                    onCreate = onSupplierCreate,
+                    modifier = Modifier.weight(1f)
+                )
             }
             SelectField(
                 value = form.concept,
@@ -341,12 +357,22 @@ private fun InvoiceForm(
                 onValueChange = { onChange(form.copy(concept = it)) }
             )
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                MoneyField(form.amount, "Monto total", { onChange(form.copy(amount = it)) }, Modifier.weight(1f))
+                MoneyField(
+                    form.amount,
+                    "Monto total",
+                    { raw ->
+                        val amount = raw.filter { it.isDigit() || it == '.' }
+                        onChange(form.copy(amount = amount, egresoCordobas = estimatedEgreso(amount, form.currency, form.rate)))
+                    },
+                    Modifier.weight(1f)
+                )
                 SelectField(
                     value = form.currency,
                     label = "Moneda",
                     options = listOf("C$", "USD"),
-                    onValueChange = { onChange(form.copy(currency = it)) },
+                    onValueChange = { currency ->
+                        onChange(form.copy(currency = currency, egresoCordobas = estimatedEgreso(form.amount, currency, form.rate)))
+                    },
                     modifier = Modifier.weight(1f)
                 )
             }
@@ -367,7 +393,43 @@ private fun InvoiceForm(
                 )
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Field(form.category, "Categoria", { onChange(form.copy(category = it)) }, Modifier.weight(1f))
+                SelectField(
+                    value = form.sourceFunds,
+                    label = "Fuente",
+                    options = listOf("Caja", "Banco", "Caja casa"),
+                    onValueChange = { onChange(form.copy(sourceFunds = it)) },
+                    modifier = Modifier.weight(1f)
+                )
+                MoneyField(
+                    value = form.rate,
+                    label = "Tasa USD",
+                    onValueChange = { raw ->
+                        val rate = raw.filter { it.isDigit() || it == '.' }
+                        val amount = form.amount.toDoubleOrNull() ?: 0.0
+                        val egreso = if (form.currency.equals("USD", true)) {
+                            ((rate.toDoubleOrNull() ?: 37.0) * amount).formatUi()
+                        } else {
+                            amount.formatUi()
+                        }
+                        onChange(form.copy(rate = rate, egresoCordobas = egreso))
+                    },
+                    modifier = Modifier.weight(1f)
+                )
+            }
+            MoneyField(
+                value = form.egresoCordobas,
+                label = "Egreso C$",
+                onValueChange = { onChange(form.copy(egresoCordobas = it)) },
+                modifier = Modifier.fillMaxWidth()
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                SelectField(
+                    value = form.category,
+                    label = "Categoria",
+                    options = webCategories(),
+                    onValueChange = { onChange(form.copy(category = it)) },
+                    modifier = Modifier.weight(1f)
+                )
                 SelectField(
                     value = form.status,
                     label = "Estado",
@@ -397,6 +459,56 @@ private fun InvoiceForm(
                 }
                 Spacer(modifier = Modifier.width(8.dp))
                 OutlinedButton(onClick = onClear) { Text("Limpiar") }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SupplierField(
+    value: String,
+    matches: List<Supplier>,
+    onValueChange: (String) -> Unit,
+    onSelect: (Supplier) -> Unit,
+    onCreate: () -> Unit,
+    modifier: Modifier
+) {
+    var expanded by remember { mutableStateOf(false) }
+
+    Column(modifier = modifier) {
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            OutlinedTextField(
+                value = value,
+                onValueChange = {
+                    onValueChange(it)
+                    expanded = true
+                },
+                label = { Text("Proveedor") },
+                singleLine = true,
+                shape = RoundedCornerShape(18.dp),
+                modifier = Modifier.weight(1f)
+            )
+            Button(onClick = onCreate, enabled = value.isNotBlank()) { Text("+") }
+        }
+        if (expanded && matches.isNotEmpty()) {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(14.dp),
+                colors = CardDefaults.cardColors(containerColor = Panel3)
+            ) {
+                Column(modifier = Modifier.padding(vertical = 4.dp)) {
+                    matches.forEach { supplier ->
+                        TextButton(
+                            onClick = {
+                                onSelect(supplier)
+                                expanded = false
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(supplier.name, color = TextMain)
+                        }
+                    }
+                }
             }
         }
     }
@@ -522,27 +634,24 @@ private fun SelectField(
 private fun InvoiceCard(invoice: Invoice, onEdit: () -> Unit, onDelete: () -> Unit) {
     Card(
         modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(16.dp),
+        shape = RoundedCornerShape(14.dp),
         colors = CardDefaults.cardColors(containerColor = Panel2)
     ) {
-        Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
+        Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 Column(modifier = Modifier.weight(1f)) {
-                    Text(invoice.number, color = TextMain, fontWeight = FontWeight.Bold)
-                    Text(invoice.supplier, color = TextSoft)
+                    Text(invoice.concept.ifBlank { invoice.number.ifBlank { "Factura ${invoice.id}" } }, color = TextMain, fontWeight = FontWeight.Bold)
+                    Text("${invoice.date} · ${invoice.supplier.ifBlank { invoice.payer }}", color = TextSoft, style = MaterialTheme.typography.bodySmall)
                 }
                 StatusBadge(invoice.status, invoice.currency)
             }
-            Text(invoice.concept, color = TextMain)
-            Text("${invoice.establishment} - ${invoice.date}", color = TextSoft)
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Text("${invoice.payer} - ${invoice.paymentMethod}", color = TextSoft)
+                Text(invoice.category, color = Brand, style = MaterialTheme.typography.bodySmall)
                 Text(invoice.displayAmount(), color = TextMain, fontWeight = FontWeight.Bold)
             }
-            Text(invoice.category, color = Brand)
-            Row {
-                TextButton(onClick = onEdit) { Text("Editar") }
-                TextButton(onClick = onDelete) { Text("Eliminar", color = Color(0xFFFF8A65)) }
+            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                TextButton(onClick = onEdit) { Text("✎") }
+                TextButton(onClick = onDelete) { Text("×", color = Color(0xFFFF8A65), fontWeight = FontWeight.Bold) }
             }
         }
     }
@@ -594,6 +703,38 @@ private fun cashLabel(currency: String, value: Double): String {
         money(value)
     }
 }
+
+private fun estimatedEgreso(amountRaw: String, currency: String, rateRaw: String): String {
+    val amount = amountRaw.toDoubleOrNull() ?: 0.0
+    val rate = rateRaw.toDoubleOrNull() ?: 37.0
+    val egreso = if (currency.equals("USD", true)) amount * rate else amount
+    return egreso.formatUi()
+}
+
+private fun Double.formatUi(): String {
+    val whole = toLong()
+    return if (this == whole.toDouble()) whole.toString() else "%.2f".format(Locale.US, this)
+}
+
+private fun webCategories(): List<String> = listOf(
+    "Insumos",
+    "Reposicion de stock",
+    "Servicios",
+    "Equipamiento",
+    "Mobiliario",
+    "Mejoras del local",
+    "Tecnologia",
+    "Salarios",
+    "Impuestos",
+    "Permisos",
+    "Alquiler",
+    "Publicidad",
+    "Branding",
+    "Promociones",
+    "FONDO",
+    "AJUSTE",
+    "Varios"
+)
 
 private fun money(value: Double): String =
     NumberFormat.getCurrencyInstance(Locale("es", "NI")).format(value)
