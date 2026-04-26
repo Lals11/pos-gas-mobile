@@ -23,6 +23,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.DrawerValue
+import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExposedDropdownMenuBox
@@ -66,7 +67,7 @@ import kotlinx.coroutines.launch
 import java.text.NumberFormat
 import java.util.Locale
 
-private const val MOBILE_API_URL = "https://script.google.com/macros/s/AKfycbx7N-TOr333K7GSrpbERZ-STzWUfRbYKpkXIT3ryJC5zqBOC-N5XVDJYpXmL0QaTOw/exec"
+private const val MOBILE_API_URL = "https://script.google.com/macros/s/AKfycbwoaEMTvYHguawC8MLJHvuk0tGHrphq6mBHjGr4RaLVUnd37RWWZX069Qnqoz8HR08/exec"
 
 private val Bg = Color(0xFF17181C)
 private val Panel = Color(0xFF1E1F24)
@@ -108,6 +109,11 @@ private fun PosGasApp(vm: MobileViewModel) {
     )
 
     MaterialTheme(colorScheme = colors) {
+        if (vm.currentUser == null) {
+            LoginScreen(onSelectUser = vm::selectUser)
+            return@MaterialTheme
+        }
+
         val drawerState = rememberDrawerState(DrawerValue.Closed)
         val scope = rememberCoroutineScope()
 
@@ -208,6 +214,36 @@ private fun PosGasApp(vm: MobileViewModel) {
                                 onDelete = { vm.deleteInvoice(invoice.id) }
                             )
                         }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun LoginScreen(onSelectUser: (String) -> Unit) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Bg)
+            .padding(20.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(22.dp),
+            colors = CardDefaults.cardColors(containerColor = Panel)
+        ) {
+            Column(modifier = Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text("Registro de Facturas", color = TextMain, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                Text("Selecciona quien va a registrar", color = TextSoft)
+                listOf("Ruth", "Luis", "Iris", "Alma").forEach { user ->
+                    Button(
+                        onClick = { onSelectUser(user) },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(user)
                     }
                 }
             }
@@ -475,7 +511,7 @@ private fun SupplierField(
 ) {
     var expanded by remember { mutableStateOf(false) }
 
-    Column(modifier = modifier) {
+    Box(modifier = modifier) {
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
             OutlinedTextField(
                 value = value,
@@ -488,27 +524,29 @@ private fun SupplierField(
                 shape = RoundedCornerShape(18.dp),
                 modifier = Modifier.weight(1f)
             )
-            Button(onClick = onCreate, enabled = value.isNotBlank()) { Text("+") }
+            Button(
+                onClick = {
+                    onCreate()
+                    expanded = false
+                },
+                enabled = value.isNotBlank()
+            ) { Text("+") }
         }
-        if (expanded && matches.isNotEmpty()) {
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(14.dp),
-                colors = CardDefaults.cardColors(containerColor = Panel3)
-            ) {
-                Column(modifier = Modifier.padding(vertical = 4.dp)) {
-                    matches.forEach { supplier ->
-                        TextButton(
-                            onClick = {
-                                onSelect(supplier)
-                                expanded = false
-                            },
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Text(supplier.name, color = TextMain)
-                        }
+        DropdownMenu(
+            expanded = expanded && matches.isNotEmpty(),
+            onDismissRequest = { expanded = false },
+            modifier = Modifier
+                .background(Panel3)
+                .fillMaxWidth()
+        ) {
+            matches.forEach { supplier ->
+                DropdownMenuItem(
+                    text = { Text(supplier.name, color = TextMain) },
+                    onClick = {
+                        onSelect(supplier)
+                        expanded = false
                     }
-                }
+                )
             }
         }
     }
@@ -646,12 +684,16 @@ private fun InvoiceCard(invoice: Invoice, onEdit: () -> Unit, onDelete: () -> Un
                 StatusBadge(invoice.status, invoice.currency)
             }
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Text(invoice.category, color = Brand, style = MaterialTheme.typography.bodySmall)
+            Text(invoice.category, color = Brand, style = MaterialTheme.typography.bodySmall)
                 Text(invoice.displayAmount(), color = TextMain, fontWeight = FontWeight.Bold)
             }
             Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                TextButton(onClick = onEdit) { Text("✎") }
-                TextButton(onClick = onDelete) { Text("×", color = Color(0xFFFF8A65), fontWeight = FontWeight.Bold) }
+                TextButton(onClick = onEdit) {
+                    Text("✎", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                }
+                TextButton(onClick = onDelete) {
+                    Text("×", color = Color(0xFFFF8A65), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                }
             }
         }
     }

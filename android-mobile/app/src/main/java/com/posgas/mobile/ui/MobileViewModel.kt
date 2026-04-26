@@ -30,7 +30,8 @@ data class Invoice(
     val cashDetail: Map<Int, Int> = emptyMap(),
     val sourceFunds: String = "",
     val egresoCordobas: Double = 0.0,
-    val rate: Double = 37.0
+    val rate: Double = 37.0,
+    val registeredBy: String = ""
 )
 
 data class Supplier(
@@ -73,6 +74,9 @@ class MobileViewModel(private val api: ApiClient) : ViewModel() {
         private set
 
     var suppliers by mutableStateOf<List<Supplier>>(emptyList())
+        private set
+
+    var currentUser by mutableStateOf<String?>(null)
         private set
 
     var downloadingHistory by mutableStateOf(false)
@@ -128,6 +132,11 @@ class MobileViewModel(private val api: ApiClient) : ViewModel() {
         loadSuppliers()
     }
 
+    fun selectUser(user: String) {
+        currentUser = user
+        syncMessage = "Usuario: $user"
+    }
+
     fun updateForm(next: InvoiceFormState) {
         form = next
         error = null
@@ -159,6 +168,9 @@ class MobileViewModel(private val api: ApiClient) : ViewModel() {
 
         if (!api.isConfigured) {
             suppliers = (suppliers + Supplier("LOCAL-PROV-${System.currentTimeMillis()}", name)).sortedBy { it.name }
+            supplierQuery = name
+            form = form.copy(supplier = name)
+            syncMessage = "Proveedor registrado localmente"
             return
         }
 
@@ -170,10 +182,16 @@ class MobileViewModel(private val api: ApiClient) : ViewModel() {
                     api.create("proveedores", mapOf("nombre" to name, "activo" to true))
                 }
             }.onSuccess { row ->
-                suppliers = (suppliers + supplierFromApi(row["row"] as? Map<String, Any?> ?: row)).distinctBy { it.name.lowercase(Locale.US) }.sortedBy { it.name }
+                suppliers = (suppliers + supplierFromApi(row["row"] as? Map<String, Any?> ?: row))
+                    .distinctBy { it.name.lowercase(Locale.US) }
+                    .sortedBy { it.name }
+                supplierQuery = name
+                form = form.copy(supplier = name)
                 syncMessage = "Proveedor registrado"
             }.onFailure {
                 suppliers = (suppliers + Supplier("LOCAL-PROV-${System.currentTimeMillis()}", name)).sortedBy { it.name }
+                supplierQuery = name
+                form = form.copy(supplier = name)
                 syncMessage = "Proveedor guardado localmente; falta redeploy de API"
             }
             saving = false
@@ -255,7 +273,8 @@ class MobileViewModel(private val api: ApiClient) : ViewModel() {
             cashDetail = form.cashDenominationsAsInts(),
             sourceFunds = form.sourceFunds,
             egresoCordobas = egreso,
-            rate = rate
+            rate = rate,
+            registeredBy = currentUser.orEmpty()
         )
 
         if (api.isConfigured) {
@@ -374,7 +393,7 @@ private fun invoiceFromApi(row: Map<String, Any?>): Invoice {
         number = row.text("numero_factura", "numero", "Numeor de factura"),
         establishment = row.text("establecimiento", "Establecimiento").ifBlank { "Villa Fontana" },
         supplier = row.text("proveedor", "Proveedor"),
-        date = row.text("fecha", "Fecha").ifBlank { today() },
+        date = normalizeDisplayDate(row.text("fecha", "Fecha").ifBlank { today() }),
         concept = row.text("concepto", "Concepto", "descripcion"),
         amount = row.number("monto_total", "total", "Monto total"),
         currency = row.text("moneda", "Moneda").ifBlank { "C$" },
@@ -386,7 +405,8 @@ private fun invoiceFromApi(row: Map<String, Any?>): Invoice {
         cashDetail = parseCashDetail(row.text("caja_detalle", "Caja detalle")),
         sourceFunds = row.text("fuente_fondos", "Fuente de fondos"),
         egresoCordobas = row.number("egreso_c", "Egreso (C$)"),
-        rate = 37.0
+        rate = 37.0,
+        registeredBy = row.text("registrado_por", "Registrado por", "creado_por")
     )
 }
 
@@ -406,7 +426,8 @@ private fun Invoice.toApiPayload(): Map<String, Any?> = mapOf(
     "egreso_c" to egresoCordobas,
     "estado" to status,
     "notas" to notes,
-    "caja_detalle" to cashDetailJson()
+    "caja_detalle" to cashDetailJson(),
+    "registrado_por" to registeredBy
 )
 
 private fun seedInvoices(): List<Invoice> = listOf(
@@ -487,7 +508,7 @@ private fun Invoice.cashDetailJson(): String {
     return "{\"moneda\":\"$currency\",\"denoms\":{$denoms},\"tasa\":${rate.formatInput()}}"
 }
 
-private fun today(): String = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+private fun today(): String = SimpleDateFormat("d/M/yyyy", Locale.US).format(Date())
 
 private fun recentInvoicesFirst(): Comparator<Invoice> {
     return compareByDescending<Invoice> { parseDateScore(it.date) }
@@ -503,6 +524,12 @@ private fun parseDateScore(raw: String): Long {
         }
     }
     return 0L
+}
+
+private fun normalizeDisplayDate(raw: String): String {
+    val score = parseDateScore(raw)
+    if (score <= 0L) return raw
+    return SimpleDateFormat("d/M/yyyy", Locale.US).format(Date(score))
 }
 
 private fun Map<String, Any?>.text(vararg keys: String): String {
