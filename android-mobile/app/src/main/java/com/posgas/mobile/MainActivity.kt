@@ -4,6 +4,7 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -42,6 +43,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -61,6 +63,8 @@ import androidx.lifecycle.ViewModelProvider
 import com.posgas.mobile.data.ApiClient
 import com.posgas.mobile.ui.Invoice
 import com.posgas.mobile.ui.InvoiceFormState
+import com.posgas.mobile.ui.InventoryItem
+import com.posgas.mobile.ui.MobileCache
 import com.posgas.mobile.ui.MobileViewModel
 import com.posgas.mobile.ui.Supplier
 import com.posgas.mobile.ui.amountInCordobas
@@ -85,15 +89,15 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        val vm = ViewModelProvider(this, Factory(MOBILE_API_URL))[MobileViewModel::class.java]
+        val vm = ViewModelProvider(this, Factory(MOBILE_API_URL, MobileCache(this)))[MobileViewModel::class.java]
         setContent { PosGasApp(vm) }
     }
 }
 
-class Factory(private val baseUrl: String) : ViewModelProvider.Factory {
+class Factory(private val baseUrl: String, private val cache: MobileCache) : ViewModelProvider.Factory {
     override fun <T : ViewModel> create(modelClass: Class<T>): T {
         @Suppress("UNCHECKED_CAST")
-        return MobileViewModel(ApiClient(baseUrl)) as T
+        return MobileViewModel(ApiClient(baseUrl), cache) as T
     }
 }
 
@@ -117,13 +121,19 @@ private fun PosGasApp(vm: MobileViewModel) {
 
         val drawerState = rememberDrawerState(DrawerValue.Closed)
         val scope = rememberCoroutineScope()
+        var detailInvoice by remember { mutableStateOf<Invoice?>(null) }
+        var deleteInvoice by remember { mutableStateOf<Invoice?>(null) }
+        var selectedSection by remember { mutableStateOf("Facturas") }
 
         ModalNavigationDrawer(
             drawerState = drawerState,
             drawerContent = {
                 AppDrawer(
-                    selected = "Facturas",
-                    onSelect = { scope.launch { drawerState.close() } }
+                    selected = selectedSection,
+                    onSelect = {
+                        selectedSection = it
+                        scope.launch { drawerState.close() }
+                    }
                 )
             }
         ) {
@@ -138,7 +148,7 @@ private fun PosGasApp(vm: MobileViewModel) {
                         },
                         title = {
                             Column {
-                                Text("Registro de Facturas", fontWeight = FontWeight.Bold)
+                                Text(if (selectedSection == "Inventario") "Inventario" else "Registro de Facturas", fontWeight = FontWeight.Bold)
                                 Text(
                                     "${vm.syncMessage} · Usuario: ${vm.currentUser.orEmpty()}",
                                     style = MaterialTheme.typography.labelSmall,
@@ -170,58 +180,106 @@ private fun PosGasApp(vm: MobileViewModel) {
                             )
                         }
                     }
-                    item {
-                        Toolbar(
-                            search = vm.search,
-                            loading = vm.downloadingHistory,
-                            onSearch = vm::updateSearch,
-                            onRefresh = vm::load
-                        )
-                    }
-                    item {
-                        SummaryPanel(
-                            total = vm.totalCostCordobas,
-                            count = vm.activeCount,
-                            usdCount = vm.usdCount
-                        )
-                    }
-                    item {
-                        InvoiceForm(
-                            form = vm.form,
-                            isEditing = vm.isEditing,
-                            saving = vm.saving,
-                            cashTotal = vm.cashTotal,
-                            supplierMatches = vm.supplierMatches,
-                            error = vm.error,
-                            onChange = vm::updateForm,
-                            onSupplierQuery = vm::updateSupplierQuery,
-                            onSupplierSelect = vm::selectSupplier,
-                            onSupplierCreate = vm::createSupplier,
-                            onSave = vm::saveInvoice,
-                            onClear = vm::clearForm
-                        )
-                    }
-                    item {
-                        Text(
-                            text = "Listado de Facturas",
-                            style = MaterialTheme.typography.titleMedium,
-                            color = TextMain,
-                            fontWeight = FontWeight.SemiBold
-                        )
-                    }
-                    if (vm.filteredInvoices.isEmpty()) {
-                        item { EmptyState() }
-                    } else {
-                        items(vm.filteredInvoices, key = { it.id.ifBlank { it.number } }) { invoice ->
-                            InvoiceCard(
-                                invoice = invoice,
-                                onEdit = { vm.editInvoice(invoice) },
-                                onDelete = { vm.deleteInvoice(invoice.id) }
+                    if (selectedSection == "Inventario") {
+                        item { InventorySummaryPanel(total = vm.inventory.size, suggested = vm.shoppingList.size) }
+                        item {
+                            InventorySearchBar(
+                                search = vm.inventorySearch,
+                                loading = vm.downloadingHistory,
+                                onSearch = vm::updateInventorySearch,
+                                onRefresh = vm::loadInventory
                             )
+                        }
+                        if (vm.filteredInventory.isEmpty()) {
+                            item { EmptyState() }
+                        } else {
+                            items(
+                                items = vm.filteredInventory,
+                                key = { it.id.ifBlank { it.name } },
+                                contentType = { "inventory-row" }
+                            ) { item ->
+                                InventoryCard(item)
+                            }
+                        }
+                    } else {
+                        item {
+                            SummaryPanel(
+                                currentMonth = vm.currentMonthTotal,
+                                previousMonth = vm.previousMonthTotal
+                            )
+                        }
+                        item {
+                            InvoiceForm(
+                                form = vm.form,
+                                isEditing = vm.isEditing,
+                                saving = vm.saving,
+                                cashTotal = vm.cashTotal,
+                                supplierMatches = vm.supplierMatches,
+                                error = vm.error,
+                                onChange = vm::updateForm,
+                                onSupplierQuery = vm::updateSupplierQuery,
+                                onSupplierSelect = vm::selectSupplier,
+                                onSupplierCreate = vm::createSupplier,
+                                onSave = vm::saveInvoice,
+                                onClear = vm::clearForm
+                            )
+                        }
+                        item {
+                            InvoiceSearchBar(
+                                search = vm.search,
+                                loading = vm.downloadingHistory,
+                                suggestions = vm.searchSuggestions,
+                                onSearch = vm::updateSearch,
+                                onRefresh = vm::load
+                            )
+                        }
+                        if (vm.filteredInvoices.isEmpty()) {
+                            item { EmptyState() }
+                        } else {
+                            items(
+                                items = vm.filteredInvoices,
+                                key = { it.id.ifBlank { it.number } },
+                                contentType = { "invoice-row" }
+                            ) { invoice ->
+                                InvoiceCard(
+                                    invoice = invoice,
+                                    onOpen = { detailInvoice = invoice }
+                                )
+                            }
                         }
                     }
                 }
             }
+        }
+
+        detailInvoice?.let { invoice ->
+            InvoiceDetailDialog(
+                invoice = invoice,
+                onDismiss = { detailInvoice = null },
+                onEdit = {
+                    vm.editInvoice(invoice)
+                    detailInvoice = null
+                },
+                onDelete = { deleteInvoice = invoice }
+            )
+        }
+
+        deleteInvoice?.let { invoice ->
+            AlertDialog(
+                onDismissRequest = { deleteInvoice = null },
+                title = { Text("Eliminar factura") },
+                text = { Text("Estas seguro que quieres eliminar la factura de ${invoice.supplier}?") },
+                confirmButton = {
+                    Button(onClick = {
+                        vm.deleteInvoice(invoice.id)
+                        deleteInvoice = null
+                        detailInvoice = null
+                    }) { Text("Eliminar") }
+                },
+                dismissButton = {
+                    OutlinedButton(onClick = { deleteInvoice = null }) { Text("Cancelar") }
+                }
+            )
         }
     }
 }
@@ -292,38 +350,104 @@ private fun AppDrawer(selected: String, onSelect: (String) -> Unit) {
 }
 
 @Composable
-private fun Toolbar(search: String, loading: Boolean, onSearch: (String) -> Unit, onRefresh: () -> Unit) {
+private fun InvoiceSearchBar(
+    search: String,
+    loading: Boolean,
+    suggestions: List<String>,
+    onSearch: (String) -> Unit,
+    onRefresh: () -> Unit
+) {
+    var expanded by remember { mutableStateOf(false) }
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(containerColor = Panel)
+    ) {
+        Box(modifier = Modifier.padding(10.dp)) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                OutlinedTextField(
+                    value = search,
+                    onValueChange = {
+                        onSearch(it)
+                        expanded = true
+                    },
+                    placeholder = { Text("Buscar proveedor o fecha") },
+                    singleLine = true,
+                    shape = RoundedCornerShape(18.dp),
+                    modifier = Modifier.weight(1f)
+                )
+                Button(onClick = onRefresh, enabled = !loading) {
+                    Text(if (loading) "..." else "↻")
+                }
+            }
+            DropdownMenu(
+                expanded = expanded && suggestions.isNotEmpty(),
+                onDismissRequest = { expanded = false },
+                properties = PopupProperties(focusable = false),
+                modifier = Modifier.background(Panel3)
+            ) {
+                suggestions.forEach { suggestion ->
+                    DropdownMenuItem(
+                        text = { Text(suggestion, color = TextMain) },
+                        onClick = {
+                            onSearch(suggestion)
+                            expanded = false
+                        }
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun InventorySearchBar(
+    search: String,
+    loading: Boolean,
+    onSearch: (String) -> Unit,
+    onRefresh: () -> Unit
+) {
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(18.dp),
         colors = CardDefaults.cardColors(containerColor = Panel)
     ) {
         Row(
-            modifier = Modifier.padding(12.dp),
+            modifier = Modifier.padding(10.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(10.dp)
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            Button(onClick = onRefresh, enabled = !loading) {
-                Text(if (loading) "Cargando" else "Actualizar")
-            }
             OutlinedTextField(
                 value = search,
                 onValueChange = onSearch,
-                placeholder = { Text("Buscar por concepto, pagador o categoria") },
+                placeholder = { Text("Buscar insumo, marca o codigo") },
                 singleLine = true,
                 shape = RoundedCornerShape(18.dp),
                 modifier = Modifier.weight(1f)
             )
+            Button(onClick = onRefresh, enabled = !loading) {
+                Text(if (loading) "..." else "â†»")
+            }
         }
     }
 }
 
 @Composable
-private fun SummaryPanel(total: Double, count: Int, usdCount: Int) {
+private fun SummaryPanel(currentMonth: Double, previousMonth: Double) {
     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        MetricCard("Total C$", money(total), Modifier.weight(1f))
-        MetricCard("Activas", count.toString(), Modifier.weight(1f))
-        MetricCard("USD", usdCount.toString(), Modifier.weight(1f))
+        MetricCard("Total mes actual", money(currentMonth), Modifier.weight(1f))
+        MetricCard("Mes anterior", money(previousMonth), Modifier.weight(1f))
+    }
+}
+
+@Composable
+private fun InventorySummaryPanel(total: Int, suggested: Int) {
+    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        MetricCard("Insumos", total.toString(), Modifier.weight(1f))
+        MetricCard("Por comprar", suggested.toString(), Modifier.weight(1f))
     }
 }
 
@@ -429,16 +553,32 @@ private fun InvoiceForm(
                     value = form.paymentMethod,
                     label = "Medio de pago",
                     options = listOf("Efectivo", "Transferencia", "Tarjeta", "Banco", "Caja"),
-                    onValueChange = { onChange(form.copy(paymentMethod = it)) },
+                    onValueChange = {
+                        val defaultSource = fundingSourceForPaymentMethod(it)
+                        onChange(
+                            form.copy(
+                                paymentMethod = it,
+                                sourceFunds = form.sourceFunds.ifBlank { defaultSource }
+                            )
+                        )
+                    },
                     modifier = Modifier.weight(1f)
                 )
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 SelectField(
                     value = form.sourceFunds,
-                    label = "Fuente",
-                    options = listOf("Caja", "Banco", "Caja casa"),
-                    onValueChange = { onChange(form.copy(sourceFunds = it)) },
+                    label = "Se paga desde",
+                    options = listOf("Caja", "Banco", "Caja chica"),
+                    onValueChange = {
+                        val source = normalizeFundingSource(it)
+                        onChange(
+                            form.copy(
+                                sourceFunds = source,
+                                cashDetail = if (source == "Caja") form.cashDetail else emptyMap()
+                            )
+                        )
+                    },
                     modifier = Modifier.weight(1f)
                 )
                 MoneyField(
@@ -448,7 +588,7 @@ private fun InvoiceForm(
                         val rate = raw.filter { it.isDigit() || it == '.' }
                         val amount = form.amount.toDoubleOrNull() ?: 0.0
                         val egreso = if (form.currency.equals("USD", true)) {
-                            ((rate.toDoubleOrNull() ?: 37.0) * amount).formatUi()
+                            ((rate.toDoubleOrNull() ?: 36.15) * amount).formatUi()
                         } else {
                             amount.formatUi()
                         }
@@ -462,6 +602,12 @@ private fun InvoiceForm(
                 label = "Egreso C$",
                 onValueChange = { onChange(form.copy(egresoCordobas = it)) },
                 modifier = Modifier.fillMaxWidth()
+            )
+            Field(
+                form.referenceFund,
+                "Referencia fondo",
+                { onChange(form.copy(referenceFund = it)) },
+                Modifier.fillMaxWidth()
             )
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 SelectField(
@@ -675,34 +821,92 @@ private fun SelectField(
 }
 
 @Composable
-private fun InvoiceCard(invoice: Invoice, onEdit: () -> Unit, onDelete: () -> Unit) {
+private fun InvoiceCard(invoice: Invoice, onOpen: () -> Unit) {
     Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(14.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onOpen),
+        shape = RoundedCornerShape(12.dp),
         colors = CardDefaults.cardColors(containerColor = Panel2)
     ) {
-        Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Row(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(invoice.supplier.ifBlank { "Sin proveedor" }, color = TextMain, fontWeight = FontWeight.SemiBold)
+                Text(invoice.date, color = TextSoft, style = MaterialTheme.typography.bodySmall)
+            }
+            Text(invoice.displayAmount(), color = TextMain, fontWeight = FontWeight.Bold)
+        }
+    }
+}
+
+@Composable
+private fun InventoryCard(item: InventoryItem) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(12.dp),
+        colors = CardDefaults.cardColors(containerColor = if (item.suggested) Panel3 else Panel2)
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
                 Column(modifier = Modifier.weight(1f)) {
-                    Text(invoice.concept.ifBlank { invoice.number.ifBlank { "Factura ${invoice.id}" } }, color = TextMain, fontWeight = FontWeight.Bold)
-                    Text("${invoice.date} · ${invoice.supplier.ifBlank { invoice.payer }}", color = TextSoft, style = MaterialTheme.typography.bodySmall)
+                    Text(item.name.ifBlank { "Sin nombre" }, color = TextMain, fontWeight = FontWeight.SemiBold)
+                    Text(listOf(item.brand, item.unit).filter { it.isNotBlank() }.joinToString(" - "), color = TextSoft, style = MaterialTheme.typography.bodySmall)
                 }
-                StatusBadge(invoice.status, invoice.currency)
+                if (item.suggested) {
+                    StatusBadge("Comprar", item.suggestedQty.formatStock())
+                }
             }
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-            Text(invoice.category, color = Brand, style = MaterialTheme.typography.bodySmall)
-                Text(invoice.displayAmount(), color = TextMain, fontWeight = FontWeight.Bold)
-            }
-            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                TextButton(onClick = onEdit) {
-                    Text("✎", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-                }
-                TextButton(onClick = onDelete) {
-                    Text("×", color = Color(0xFFFF8A65), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-                }
+                Text("Stock: ${item.stock.formatStock()}", color = TextSoft, style = MaterialTheme.typography.bodySmall)
+                Text("Min: ${item.minStock.formatStock()}", color = TextSoft, style = MaterialTheme.typography.bodySmall)
             }
         }
     }
+}
+
+@Composable
+private fun InvoiceDetailDialog(
+    invoice: Invoice,
+    onDismiss: () -> Unit,
+    onEdit: () -> Unit,
+    onDelete: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(invoice.supplier.ifBlank { "Detalle de factura" }) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                DetailLine("Fecha", invoice.date)
+                DetailLine("Monto", invoice.displayAmount())
+                DetailLine("Numero", invoice.number)
+                DetailLine("Establecimiento", invoice.establishment)
+                DetailLine("Concepto", invoice.concept)
+                DetailLine("Pagador", invoice.payer)
+                DetailLine("Medio", invoice.paymentMethod)
+                DetailLine("Categoria", invoice.category)
+                DetailLine("Fuente", invoice.sourceFunds)
+                DetailLine("Egreso C$", money(invoice.egresoCordobas))
+                DetailLine("Referencia", invoice.referenceFund)
+                DetailLine("Registrado por", invoice.registeredBy)
+            }
+        },
+        confirmButton = { Button(onClick = onEdit) { Text("Modificar") } },
+        dismissButton = { OutlinedButton(onClick = onDelete) { Text("Eliminar") } }
+    )
+}
+
+@Composable
+private fun DetailLine(label: String, value: String) {
+    if (value.isBlank()) return
+    Text("$label: $value", color = TextMain)
 }
 
 @Composable
@@ -740,8 +944,23 @@ private fun Invoice.displayAmount(): String {
 }
 
 private fun InvoiceFormState.usesCash(): Boolean {
-    val method = paymentMethod.lowercase(Locale.US)
-    return method == "efectivo" || method == "caja"
+    return normalizeFundingSource(sourceFunds.ifBlank { fundingSourceForPaymentMethod(paymentMethod) }) == "Caja"
+}
+
+private fun fundingSourceForPaymentMethod(paymentMethod: String): String {
+    return when (paymentMethod.lowercase(Locale.US)) {
+        "banco", "transferencia", "tarjeta" -> "Banco"
+        "efectivo", "caja" -> "Caja"
+        else -> ""
+    }
+}
+
+private fun normalizeFundingSource(source: String): String {
+    return when (source.lowercase(Locale.US)) {
+        "caja casa", "caja chica" -> "Caja chica"
+        "caja normal", "caja registradora" -> "Caja"
+        else -> source
+    }
 }
 
 private fun cashLabel(currency: String, value: Double): String {
@@ -754,12 +973,17 @@ private fun cashLabel(currency: String, value: Double): String {
 
 private fun estimatedEgreso(amountRaw: String, currency: String, rateRaw: String): String {
     val amount = amountRaw.toDoubleOrNull() ?: 0.0
-    val rate = rateRaw.toDoubleOrNull() ?: 37.0
+    val rate = rateRaw.toDoubleOrNull() ?: 36.15
     val egreso = if (currency.equals("USD", true)) amount * rate else amount
     return egreso.formatUi()
 }
 
 private fun Double.formatUi(): String {
+    val whole = toLong()
+    return if (this == whole.toDouble()) whole.toString() else "%.2f".format(Locale.US, this)
+}
+
+private fun Double.formatStock(): String {
     val whole = toLong()
     return if (this == whole.toDouble()) whole.toString() else "%.2f".format(Locale.US, this)
 }
@@ -784,5 +1008,6 @@ private fun webCategories(): List<String> = listOf(
     "Varios"
 )
 
-private fun money(value: Double): String =
-    NumberFormat.getCurrencyInstance(Locale("es", "NI")).format(value)
+private val cordobaFormat: NumberFormat = NumberFormat.getCurrencyInstance(Locale("es", "NI"))
+
+private fun money(value: Double): String = cordobaFormat.format(value)

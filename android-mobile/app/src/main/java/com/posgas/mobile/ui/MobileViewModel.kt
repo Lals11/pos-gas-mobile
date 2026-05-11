@@ -9,6 +9,7 @@ import com.posgas.mobile.data.ApiClient
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.text.Normalizer
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -30,13 +31,27 @@ data class Invoice(
     val cashDetail: Map<Int, Int> = emptyMap(),
     val sourceFunds: String = "",
     val egresoCordobas: Double = 0.0,
-    val rate: Double = 37.0,
-    val registeredBy: String = ""
+    val rate: Double = 36.15,
+    val registeredBy: String = "",
+    val referenceFund: String = ""
 )
 
 data class Supplier(
     val id: String,
     val name: String,
+    val active: Boolean = true
+)
+
+data class InventoryItem(
+    val id: String,
+    val name: String,
+    val brand: String = "",
+    val unit: String = "",
+    val stock: Double = 0.0,
+    val minStock: Double = 0.0,
+    val suggestedQty: Double = 0.0,
+    val suggested: Boolean = false,
+    val barcode: String = "",
     val active: Boolean = true
 )
 
@@ -57,11 +72,12 @@ data class InvoiceFormState(
     val cashDetail: Map<Int, String> = emptyMap(),
     val sourceFunds: String = "",
     val egresoCordobas: String = "",
-    val rate: String = "37"
+    val rate: String = "36.15",
+    val referenceFund: String = ""
 )
 
-class MobileViewModel(private val api: ApiClient) : ViewModel() {
-    var invoices by mutableStateOf(seedInvoices())
+class MobileViewModel(private val api: ApiClient, private val cache: MobileCache) : ViewModel() {
+    var invoices by mutableStateOf(cache.loadInvoices().ifEmpty { seedInvoices() })
         private set
 
     var form by mutableStateOf(InvoiceFormState())
@@ -73,7 +89,13 @@ class MobileViewModel(private val api: ApiClient) : ViewModel() {
     var supplierQuery by mutableStateOf("")
         private set
 
-    var suppliers by mutableStateOf<List<Supplier>>(emptyList())
+    var suppliers by mutableStateOf(cache.loadSuppliers())
+        private set
+
+    var inventory by mutableStateOf(cache.loadInventory())
+        private set
+
+    var inventorySearch by mutableStateOf("")
         private set
 
     var currentUser by mutableStateOf<String?>(null)
@@ -96,22 +118,29 @@ class MobileViewModel(private val api: ApiClient) : ViewModel() {
 
     val filteredInvoices: List<Invoice>
         get() {
-            val q = search.trim().lowercase(Locale.US)
+            val q = search.searchKey()
             if (q.isBlank()) return invoices
             return invoices.filter {
-                listOf(it.number, it.supplier, it.concept, it.category, it.payer, it.establishment)
-                    .any { value -> value.lowercase(Locale.US).contains(q) }
+                listOf(it.supplier, it.date)
+                    .any { value -> value.searchKey().contains(q) }
             }
         }
 
-    val totalCostCordobas: Double
-        get() = invoices.filter { it.status != "Anulada" }.sumOf { it.amountInCordobas() }
+    val currentMonthTotal: Double
+        get() = invoices.filter { sameMonth(it.date, 0) && it.status != "Anulada" }.sumOf { it.amountInCordobas(it.rate) }
 
-    val activeCount: Int
-        get() = invoices.count { it.status != "Anulada" }
+    val previousMonthTotal: Double
+        get() = invoices.filter { sameMonth(it.date, -1) && it.status != "Anulada" }.sumOf { it.amountInCordobas(it.rate) }
 
-    val usdCount: Int
-        get() = invoices.count { it.currency.equals("USD", ignoreCase = true) }
+    val searchSuggestions: List<String>
+        get() {
+            val q = search.searchKey()
+            return invoices
+                .flatMap { listOf(it.supplier, it.date) }
+                .filter { it.isNotBlank() && (q.isBlank() || it.searchKey().contains(q)) }
+                .distinct()
+                .take(6)
+        }
 
     val cashTotal: Double
         get() = form.cashDetail.entries.sumOf { (denomination, quantity) ->
@@ -120,16 +149,32 @@ class MobileViewModel(private val api: ApiClient) : ViewModel() {
 
     val supplierMatches: List<Supplier>
         get() {
-            val q = supplierQuery.ifBlank { form.supplier }.trim().lowercase(Locale.US)
+            val q = supplierQuery.ifBlank { form.supplier }.searchKey()
             if (q.isBlank()) return suppliers.take(6)
             return suppliers
-                .filter { it.active && it.name.lowercase(Locale.US).contains(q) }
+                .filter { it.active && it.name.searchKey().contains(q) }
                 .take(6)
         }
+
+    val filteredInventory: List<InventoryItem>
+        get() {
+            val q = inventorySearch.searchKey()
+            val source = if (q.isBlank()) inventory else {
+                inventory.filter {
+                    listOf(it.name, it.brand, it.barcode)
+                        .any { value -> value.searchKey().contains(q) }
+                }
+            }
+            return source.sortedWith(compareByDescending<InventoryItem> { it.suggested }.thenBy { it.name.searchKey() })
+        }
+
+    val shoppingList: List<InventoryItem>
+        get() = inventory.filter { it.suggested }.sortedBy { it.name.searchKey() }
 
     init {
         load()
         loadSuppliers()
+        loadInventory()
     }
 
     fun selectUser(user: String) {
@@ -152,6 +197,10 @@ class MobileViewModel(private val api: ApiClient) : ViewModel() {
         error = null
     }
 
+    fun updateInventorySearch(next: String) {
+        inventorySearch = next
+    }
+
     fun selectSupplier(supplier: Supplier) {
         supplierQuery = supplier.name
         form = form.copy(supplier = supplier.name)
@@ -164,10 +213,11 @@ class MobileViewModel(private val api: ApiClient) : ViewModel() {
             error = "Escribe el nombre del proveedor."
             return
         }
-        if (suppliers.any { it.name.equals(name, ignoreCase = true) }) return
+        if (suppliers.any { it.name.searchKey() == name.searchKey() }) return
 
         if (!api.isConfigured) {
             suppliers = (suppliers + Supplier("LOCAL-PROV-${System.currentTimeMillis()}", name)).sortedBy { it.name }
+            cache.saveSuppliers(suppliers)
             supplierQuery = name
             form = form.copy(supplier = name)
             syncMessage = "Proveedor registrado localmente"
@@ -183,13 +233,15 @@ class MobileViewModel(private val api: ApiClient) : ViewModel() {
                 }
             }.onSuccess { row ->
                 suppliers = (suppliers + supplierFromApi(row["row"] as? Map<String, Any?> ?: row))
-                    .distinctBy { it.name.lowercase(Locale.US) }
+                    .distinctBy { it.name.searchKey() }
                     .sortedBy { it.name }
+                cache.saveSuppliers(suppliers)
                 supplierQuery = name
                 form = form.copy(supplier = name)
                 syncMessage = "Proveedor registrado"
             }.onFailure {
                 suppliers = (suppliers + Supplier("LOCAL-PROV-${System.currentTimeMillis()}", name)).sortedBy { it.name }
+                cache.saveSuppliers(suppliers)
                 supplierQuery = name
                 form = form.copy(supplier = name)
                 syncMessage = "Proveedor guardado localmente; falta redeploy de API"
@@ -209,6 +261,7 @@ class MobileViewModel(private val api: ApiClient) : ViewModel() {
                 }
             }.onSuccess {
                 invoices = it
+                cache.saveInvoices(it)
                 syncMessage = "Sincronizado con API"
             }.onFailure {
                 error = it.message
@@ -221,6 +274,7 @@ class MobileViewModel(private val api: ApiClient) : ViewModel() {
     fun loadSuppliers() {
         if (!api.isConfigured) {
             suppliers = suppliersFromInvoices()
+            cache.saveSuppliers(suppliers)
             return
         }
         viewModelScope.launch {
@@ -228,9 +282,32 @@ class MobileViewModel(private val api: ApiClient) : ViewModel() {
                 withContext(Dispatchers.IO) { api.list("proveedores").map(::supplierFromApi) }
             }.onSuccess {
                 suppliers = it.ifEmpty { suppliersFromInvoices() }
+                cache.saveSuppliers(suppliers)
             }.onFailure {
                 suppliers = suppliersFromInvoices()
+                cache.saveSuppliers(suppliers)
             }
+        }
+    }
+
+    fun loadInventory() {
+        if (!api.isConfigured) return
+        viewModelScope.launch {
+            downloadingHistory = true
+            error = null
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    api.list("lista_compras").map(::inventoryItemFromApi)
+                }
+            }.onSuccess {
+                inventory = it
+                cache.saveInventory(it)
+                syncMessage = "Inventario sincronizado"
+            }.onFailure {
+                error = it.message
+                syncMessage = "No se pudo sincronizar inventario"
+            }
+            downloadingHistory = false
         }
     }
 
@@ -248,11 +325,16 @@ class MobileViewModel(private val api: ApiClient) : ViewModel() {
             error = "El monto debe ser mayor a 0."
             return
         }
-        if (form.usesCash() && cashTotal != amount) {
+        val sourceFunds = form.normalizedSourceFunds()
+        if (form.affectsBusinessFunds() && sourceFunds.isBlank()) {
+            error = "Selecciona si se pago desde caja normal, banco o caja chica."
+            return
+        }
+        if (sourceFunds == "Caja" && kotlin.math.abs(cashTotal - amount) > 0.009) {
             error = "El total de billetes debe coincidir con el monto."
             return
         }
-        val rate = form.rate.toDoubleOrNull() ?: 37.0
+        val rate = form.rate.toDoubleOrNull() ?: 36.15
         val egreso = form.egresoCordobas.toDoubleOrNull()
             ?: if (form.currency.equals("USD", ignoreCase = true)) amount * rate else amount
 
@@ -270,11 +352,12 @@ class MobileViewModel(private val api: ApiClient) : ViewModel() {
             category = form.category.trim(),
             status = form.status.trim().ifBlank { "Activa" },
             notes = form.notes.trim(),
-            cashDetail = form.cashDenominationsAsInts(),
-            sourceFunds = form.sourceFunds,
+            cashDetail = if (sourceFunds == "Caja") form.cashDenominationsAsInts() else emptyMap(),
+            sourceFunds = sourceFunds,
             egresoCordobas = egreso,
             rate = rate,
-            registeredBy = currentUser.orEmpty()
+            registeredBy = currentUser.orEmpty(),
+            referenceFund = form.referenceFund.trim()
         )
 
         if (api.isConfigured) {
@@ -303,7 +386,8 @@ class MobileViewModel(private val api: ApiClient) : ViewModel() {
             cashDetail = invoice.cashDetail.mapValues { it.value.toString() },
             sourceFunds = invoice.sourceFunds,
             egresoCordobas = invoice.egresoCordobas.formatInput(),
-            rate = invoice.rate.formatInput()
+            rate = invoice.rate.formatInput(),
+            referenceFund = invoice.referenceFund
         )
         supplierQuery = invoice.supplier
         error = null
@@ -312,6 +396,7 @@ class MobileViewModel(private val api: ApiClient) : ViewModel() {
     fun deleteInvoice(id: String) {
         if (id.isBlank() || !api.isConfigured) {
             invoices = invoices.filterNot { it.id == id }
+            cache.saveInvoices(invoices)
             if (form.id == id) clearForm()
             return
         }
@@ -323,6 +408,7 @@ class MobileViewModel(private val api: ApiClient) : ViewModel() {
                 withContext(Dispatchers.IO) { api.delete("facturas", id) }
             }.onSuccess {
                 invoices = invoices.filterNot { it.id == id }
+                cache.saveInvoices(invoices)
                 if (form.id == id) clearForm()
                 syncMessage = "Factura eliminada"
             }.onFailure {
@@ -369,21 +455,23 @@ class MobileViewModel(private val api: ApiClient) : ViewModel() {
         }
         suppliers = (suppliers + Supplier("LOCAL-PROV-${System.currentTimeMillis()}", invoice.supplier))
             .filter { it.name.isNotBlank() }
-            .distinctBy { it.name.lowercase(Locale.US) }
+            .distinctBy { it.name.searchKey() }
             .sortedBy { it.name }
+        cache.saveInvoices(invoices)
+        cache.saveSuppliers(suppliers)
         clearForm()
     }
 
     private fun suppliersFromInvoices(): List<Supplier> {
         return invoices
             .mapNotNull { invoice -> invoice.supplier.takeIf { it.isNotBlank() } }
-            .distinctBy { it.lowercase(Locale.US) }
+            .distinctBy { it.searchKey() }
             .sorted()
             .mapIndexed { index, name -> Supplier("LOCAL-$index", name) }
     }
 }
 
-fun Invoice.amountInCordobas(rate: Double = 37.0): Double {
+fun Invoice.amountInCordobas(rate: Double = 36.15): Double {
     return if (currency.equals("USD", ignoreCase = true)) amount * rate else amount
 }
 
@@ -405,8 +493,9 @@ private fun invoiceFromApi(row: Map<String, Any?>): Invoice {
         cashDetail = parseCashDetail(row.text("caja_detalle", "Caja detalle")),
         sourceFunds = row.text("fuente_fondos", "Fuente de fondos"),
         egresoCordobas = row.number("egreso_c", "Egreso (C$)"),
-        rate = 37.0,
-        registeredBy = row.text("registrado_por", "Registrado por", "creado_por")
+        rate = 36.15,
+        registeredBy = row.text("registrado_por", "Registrado por", "creado_por"),
+        referenceFund = row.text("referencia_fondo", "Referencia fondo")
     )
 }
 
@@ -427,7 +516,8 @@ private fun Invoice.toApiPayload(): Map<String, Any?> = mapOf(
     "estado" to status,
     "notas" to notes,
     "caja_detalle" to cashDetailJson(),
-    "registrado_por" to registeredBy
+    "registrado_por" to registeredBy,
+    "referencia_fondo" to referenceFund
 )
 
 private fun seedInvoices(): List<Invoice> = listOf(
@@ -467,9 +557,44 @@ private fun supplierFromApi(row: Map<String, Any?>): Supplier {
     )
 }
 
-private fun InvoiceFormState.usesCash(): Boolean {
-    val method = paymentMethod.lowercase(Locale.US)
-    return method == "efectivo" || method == "caja"
+private fun inventoryItemFromApi(row: Map<String, Any?>): InventoryItem {
+    return InventoryItem(
+        id = row.text("id", "id_insumos", "ID_Insumo"),
+        name = row.text("nombre", "Nombre"),
+        brand = row.text("marca", "Marca"),
+        unit = row.text("unidad", "unidad_inventario", "Unidad"),
+        stock = row.number("stock_actual_num", "stock_actual", "stock"),
+        minStock = row.number("stock_minimo_num", "stock_minimo", "stockMinimo"),
+        suggestedQty = row.number("cantidad_sugerida"),
+        suggested = row.bool("comprar_sugerido"),
+        barcode = row.text("codigo", "codigo de barra", "Codigo"),
+        active = row.bool("activo_bool", default = true)
+    )
+}
+
+private fun InvoiceFormState.affectsBusinessFunds(): Boolean {
+    return payer.equals("Grano y alma", ignoreCase = true)
+}
+
+private fun InvoiceFormState.normalizedSourceFunds(): String {
+    return normalizeSourceFunds(sourceFunds.ifBlank { defaultSourceFundsForPaymentMethod(paymentMethod) })
+}
+
+private fun normalizeSourceFunds(value: String): String {
+    return when (value.searchKey()) {
+        "banco", "transferencia", "tarjeta", "cuenta bancaria" -> "Banco"
+        "caja", "caja normal", "efectivo", "caja registradora" -> "Caja"
+        "caja chica", "caja casa", "chica" -> "Caja chica"
+        else -> value.trim()
+    }
+}
+
+private fun defaultSourceFundsForPaymentMethod(paymentMethod: String): String {
+    return when (paymentMethod.searchKey()) {
+        "banco", "transferencia", "tarjeta" -> "Banco"
+        "efectivo", "caja" -> "Caja"
+        else -> ""
+    }
 }
 
 private fun InvoiceFormState.cashDenominationsAsInts(): Map<Int, Int> {
@@ -532,6 +657,17 @@ private fun normalizeDisplayDate(raw: String): String {
     return SimpleDateFormat("d/M/yyyy", Locale.US).format(Date(score))
 }
 
+private fun sameMonth(raw: String, monthOffset: Int): Boolean {
+    val score = parseDateScore(raw)
+    if (score <= 0L) return false
+    val target = java.util.Calendar.getInstance()
+    target.add(java.util.Calendar.MONTH, monthOffset)
+    val date = java.util.Calendar.getInstance()
+    date.time = Date(score)
+    return target.get(java.util.Calendar.YEAR) == date.get(java.util.Calendar.YEAR) &&
+        target.get(java.util.Calendar.MONTH) == date.get(java.util.Calendar.MONTH)
+}
+
 private fun Map<String, Any?>.text(vararg keys: String): String {
     for (key in keys) {
         val value = this[key]
@@ -544,7 +680,19 @@ private fun Map<String, Any?>.number(vararg keys: String): Double {
     return text(*keys).replace(",", "").toDoubleOrNull() ?: 0.0
 }
 
+private fun Map<String, Any?>.bool(vararg keys: String, default: Boolean = false): Boolean {
+    val raw = text(*keys).ifBlank { return default }.searchKey()
+    return raw == "true" || raw == "si" || raw == "1" || raw == "yes"
+}
+
 private fun Double.formatInput(): String {
     val whole = toLong()
     return if (this == whole.toDouble()) whole.toString() else "%.2f".format(Locale.US, this)
+}
+
+private fun String.searchKey(): String {
+    val normalized = Normalizer.normalize(trim(), Normalizer.Form.NFD)
+    return normalized
+        .replace(Regex("\\p{InCombiningDiacriticalMarks}+"), "")
+        .lowercase(Locale.US)
 }
