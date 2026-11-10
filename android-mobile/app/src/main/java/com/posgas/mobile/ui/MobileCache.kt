@@ -7,6 +7,11 @@ import org.json.JSONObject
 class MobileCache(context: Context) {
     private val prefs = context.getSharedPreferences("pos_gas_mobile_cache", Context.MODE_PRIVATE)
 
+    fun loadPendingSale(deployment: String): String? = prefs.getString("pending-sale:$deployment", null)
+
+    fun savePendingSale(deployment: String, json: String?): Boolean =
+        prefs.edit().putString("pending-sale:$deployment", json).commit()
+
     fun loadInvoices(): List<Invoice> = runCatching {
         val raw = prefs.getString("invoices", "[]").orEmpty()
         val arr = JSONArray(raw)

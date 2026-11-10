@@ -3,6 +3,9 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+val apiDeployment = providers.gradleProperty("gyaApiDeploymentId").orElse("")
+val apiScopes = providers.gradleProperty("gyaApiScopes").orElse("")
+
 android {
     namespace = "com.posgas.mobile"
     compileSdk = 34
@@ -13,6 +16,8 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "1.0"
+        buildConfigField("String", "API_DEPLOYMENT_ID", "\"${apiDeployment.get()}\"")
+        buildConfigField("String", "API_SCOPES", "\"${apiScopes.get()}\"")
     }
 
     buildTypes {
@@ -24,7 +29,10 @@ android {
             )
         }
     }
-    buildFeatures { compose = true }
+    buildFeatures {
+        compose = true
+        buildConfig = true
+    }
     composeOptions { kotlinCompilerExtensionVersion = "1.5.14" }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -39,6 +47,7 @@ dependencies {
     implementation("androidx.compose.ui:ui:1.6.8")
     implementation("androidx.compose.material3:material3:1.2.1")
     implementation("androidx.compose.ui:ui-tooling-preview:1.6.8")
+    implementation("com.google.android.gms:play-services-auth:22.0.0")
     debugImplementation("androidx.compose.ui:ui-tooling:1.6.8")
 
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")

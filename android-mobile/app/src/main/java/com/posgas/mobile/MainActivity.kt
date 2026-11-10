@@ -3,8 +3,16 @@ package com.posgas.mobile
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.result.IntentSenderRequest
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.LocalIndication
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsFocusedAsState
+import androidx.compose.foundation.interaction.collectIsHoveredAsState
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -15,12 +23,21 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ExitToApp
+import androidx.compose.material.icons.automirrored.filled.List
+import androidx.compose.material.icons.filled.AddCircle
+import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.DrawerValue
@@ -30,6 +47,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExposedDropdownMenuBox
 import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalDrawerSheet
@@ -46,33 +64,52 @@ import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.PopupProperties
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import com.posgas.mobile.data.ApiClient
 import com.posgas.mobile.ui.Invoice
+import com.posgas.mobile.ui.AccountBalance
+import com.posgas.mobile.ui.AccountMovement
 import com.posgas.mobile.ui.InvoiceFormState
 import com.posgas.mobile.ui.InventoryItem
 import com.posgas.mobile.ui.MobileCache
 import com.posgas.mobile.ui.MobileViewModel
 import com.posgas.mobile.ui.Supplier
 import com.posgas.mobile.ui.amountInCordobas
+import com.posgas.mobile.ui.accountTimeZone
+import com.google.android.gms.auth.api.identity.AuthorizationRequest
+import com.google.android.gms.auth.api.identity.Identity
+import com.google.android.gms.common.api.Scope
 import kotlinx.coroutines.launch
 import java.text.NumberFormat
+import java.text.DateFormatSymbols
+import java.util.Calendar
 import java.util.Locale
-
-private const val MOBILE_API_URL = "https://script.google.com/macros/s/AKfycbwf5QVz4iphAyKY4sawG3MkOWn-PvsSVR7QMvgDfvtMQ7Ku_sLbriFFCsPK0r-p0qc/exec"
+import java.util.UUID
 
 private val Bg = Color(0xFF17181C)
 private val Panel = Color(0xFF1E1F24)
@@ -84,26 +121,50 @@ private val TextMain = Color(0xFFD3D3D3)
 private val TextSoft = Color(0xFFA9A9A9)
 private val Ok = Color(0xFF10B981)
 private val Err = Color(0xFFB91C1C)
+private val Accounts = listOf("Banco", "Caja chica", "Caja")
 
 class MainActivity : ComponentActivity() {
+    private lateinit var vm: MobileViewModel
+    private val authorization = registerForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { result ->
+        runCatching { Identity.getAuthorizationClient(this).getAuthorizationResultFromIntent(result.data).accessToken }
+            .onSuccess(vm::authorizeSession)
+            .onFailure { vm.authorizationFailed("No se completó la autorización de Google.") }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        val vm = ViewModelProvider(this, Factory(MOBILE_API_URL, MobileCache(this)))[MobileViewModel::class.java]
-        setContent { PosGasApp(vm) }
+        vm = ViewModelProvider(this, Factory(BuildConfig.API_DEPLOYMENT_ID, MobileCache(this)))[MobileViewModel::class.java]
+        setContent { PosGasApp(vm, ::authorizeGoogle) }
+    }
+
+    private fun authorizeGoogle() {
+        val scopes = BuildConfig.API_SCOPES.split(',').map { it.trim() }.filter { it.isNotEmpty() }.map(::Scope)
+        if (!vm.beginAuthorization()) return
+        val request = AuthorizationRequest.builder().setRequestedScopes(scopes).build()
+        Identity.getAuthorizationClient(this).authorize(request)
+            .addOnSuccessListener(this) { result ->
+                val resolution = result.pendingIntent
+                if (result.hasResolution() && resolution != null) {
+                    authorization.launch(IntentSenderRequest.Builder(resolution.intentSender).build())
+                } else {
+                    vm.authorizeSession(result.accessToken)
+                }
+            }
+            .addOnFailureListener(this) { vm.authorizationFailed("Google no pudo autorizar la cuenta. Revisa la configuración OAuth.") }
     }
 }
 
-class Factory(private val baseUrl: String, private val cache: MobileCache) : ViewModelProvider.Factory {
+class Factory(private val deploymentId: String, private val cache: MobileCache) : ViewModelProvider.Factory {
     override fun <T : ViewModel> create(modelClass: Class<T>): T {
         @Suppress("UNCHECKED_CAST")
-        return MobileViewModel(ApiClient(baseUrl), cache) as T
+        return MobileViewModel(ApiClient(deploymentId), cache) as T
     }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun PosGasApp(vm: MobileViewModel) {
+private fun PosGasApp(vm: MobileViewModel, onAuthorize: () -> Unit) {
     val colors = MaterialTheme.colorScheme.copy(
         primary = Brand,
         secondary = Brand2,
@@ -115,7 +176,7 @@ private fun PosGasApp(vm: MobileViewModel) {
 
     MaterialTheme(colorScheme = colors) {
         if (vm.currentUser == null) {
-            LoginScreen(onSelectUser = vm::selectUser)
+            LoginScreen(vm, onAuthorize)
             return@MaterialTheme
         }
 
@@ -123,13 +184,23 @@ private fun PosGasApp(vm: MobileViewModel) {
         val scope = rememberCoroutineScope()
         var detailInvoice by remember { mutableStateOf<Invoice?>(null) }
         var deleteInvoice by remember { mutableStateOf<Invoice?>(null) }
-        var selectedSection by remember { mutableStateOf("Facturas") }
+        var selectedSection by rememberSaveable { mutableStateOf("Cuentas") }
+        var expandedAccount by rememberSaveable { mutableStateOf<String?>(null) }
+        var accountAction by rememberSaveable { mutableStateOf<String?>(null) }
+        var movementType by rememberSaveable { mutableStateOf<String?>(null) }
+        var saleAccount by rememberSaveable { mutableStateOf<String?>(null) }
+        var catalog by rememberSaveable { mutableStateOf<String?>(null) }
+
+        LaunchedEffect(vm.currentUser) {
+            vm.loadCatalog("conceptos")
+        }
 
         ModalNavigationDrawer(
             drawerState = drawerState,
             drawerContent = {
                 AppDrawer(
                     selected = selectedSection,
+                    onAuthorize = onAuthorize,
                     onSelect = {
                         selectedSection = it
                         scope.launch { drawerState.close() }
@@ -148,7 +219,14 @@ private fun PosGasApp(vm: MobileViewModel) {
                         },
                         title = {
                             Column {
-                                Text(if (selectedSection == "Inventario") "Inventario" else "Registro de Facturas", fontWeight = FontWeight.Bold)
+                                Text(
+                                    when (selectedSection) {
+                                        "Cuentas" -> "Cuentas"
+                                        "Inventario" -> "Inventario"
+                                        else -> "Registro de Facturas"
+                                    },
+                                    fontWeight = FontWeight.Bold
+                                )
                                 Text(
                                     "${vm.syncMessage} · Usuario: ${vm.currentUser.orEmpty()}",
                                     style = MaterialTheme.typography.labelSmall,
@@ -180,7 +258,44 @@ private fun PosGasApp(vm: MobileViewModel) {
                             )
                         }
                     }
-                    if (selectedSection == "Inventario") {
+                    if (selectedSection == "Cuentas") {
+                        if (vm.pendingSale != null) {
+                            item {
+                                OutlinedButton(onClick = { saleAccount = "Pendiente" }, modifier = Modifier.fillMaxWidth()) {
+                                    Text("Consultar venta pendiente")
+                                }
+                            }
+                        }
+                        items(Accounts, key = { it }) { account ->
+                            AccountCard(
+                                account = account,
+                                balance = vm.balances[account],
+                                expanded = expandedAccount == account,
+                                selectedAction = accountAction.takeIf { expandedAccount == account },
+                                onToggle = {
+                                    expandedAccount = if (expandedAccount == account) null else account
+                                    accountAction = null
+                                },
+                                onAction = { accountAction = it }
+                            )
+                        }
+                        if (accountAction != "Factura") {
+                            if (vm.accountLoading) item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
+                            vm.accountError?.let { message ->
+                                item {
+                                    Text(message, color = TextSoft)
+                                    TextButton(onClick = { vm.loadAccounts() }) { Text("Reintentar") }
+                                }
+                            }
+                        }
+                        if (accountAction == "Factura") {
+                            item {
+                                CompactInvoiceForm(vm, expandedAccount, onCatalog = { catalog = it }) {
+                                    accountAction = "Detalles"
+                                }
+                            }
+                        }
+                    } else if (selectedSection == "Inventario") {
                         item { InventorySummaryPanel(total = vm.inventory.size, suggested = vm.shoppingList.size) }
                         item {
                             InventorySearchBar(
@@ -209,7 +324,7 @@ private fun PosGasApp(vm: MobileViewModel) {
                             )
                         }
                         item {
-                            InvoiceForm(
+                            if (vm.isEditing) InvoiceForm(
                                 form = vm.form,
                                 isEditing = vm.isEditing,
                                 saving = vm.saving,
@@ -220,9 +335,9 @@ private fun PosGasApp(vm: MobileViewModel) {
                                 onSupplierQuery = vm::updateSupplierQuery,
                                 onSupplierSelect = vm::selectSupplier,
                                 onSupplierCreate = vm::createSupplier,
-                                onSave = vm::saveInvoice,
+                                onSave = { vm.saveInvoice() },
                                 onClear = vm::clearForm
-                            )
+                            ) else CompactInvoiceForm(vm, null, onCatalog = { catalog = it })
                         }
                         item {
                             InvoiceSearchBar(
@@ -238,7 +353,6 @@ private fun PosGasApp(vm: MobileViewModel) {
                         } else {
                             items(
                                 items = vm.filteredInvoices,
-                                key = { it.id.ifBlank { it.number } },
                                 contentType = { "invoice-row" }
                             ) { invoice ->
                                 InvoiceCard(
@@ -252,12 +366,69 @@ private fun PosGasApp(vm: MobileViewModel) {
             }
         }
 
+        if (selectedSection == "Cuentas" && accountAction == "Detalles") {
+            expandedAccount?.let { account ->
+                AccountHistoryDialog(vm, account) { accountAction = null }
+            }
+        }
+
+        if (selectedSection == "Cuentas" && movementType == null && accountAction in listOf("Salida", "Ingresos")) {
+            val isIncome = accountAction == "Ingresos"
+            AlertDialog(
+                onDismissRequest = { accountAction = null },
+                title = { Text("${accountAction.orEmpty()} · ${expandedAccount.orEmpty()}") },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        val options = if (isIncome) listOf("Venta", "Devolución")
+                        else listOf("Transferencia entre cuentas", "Registro de factura")
+                        options.forEach { option ->
+                            OutlinedButton(
+                                onClick = {
+                                    vm.clearError()
+                                    if (option == "Registro de factura") {
+                                        vm.beginAccountInvoice(expandedAccount.orEmpty())
+                                        accountAction = "Factura"
+                                    } else if (option == "Venta") {
+                                        saleAccount = expandedAccount
+                                        accountAction = null
+                                    } else movementType = option
+                                },
+                                modifier = Modifier.fillMaxWidth()
+                            ) { Text(option) }
+                        }
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = { accountAction = null }) { Text("Cerrar") }
+                }
+            )
+        }
+
+        saleAccount?.let { account ->
+            SaleScreen(vm, account, onClose = { saleAccount = null }, onAuthorize = onAuthorize)
+        }
+
+        movementType?.takeIf { it == "Devolución" || it == "Transferencia entre cuentas" }?.let { type ->
+            expandedAccount?.let { account ->
+                MovementDialog(vm, account, type, onDismiss = {
+                    movementType = null
+                    accountAction = null
+                }, onSaved = {
+                    movementType = null
+                    accountAction = "Detalles"
+                })
+            }
+        }
+
+        catalog?.let { entity -> CatalogDialog(vm, entity) { catalog = null } }
+
         detailInvoice?.let { invoice ->
             InvoiceDetailDialog(
                 invoice = invoice,
                 onDismiss = { detailInvoice = null },
                 onEdit = {
                     vm.editInvoice(invoice)
+                    selectedSection = "Facturas"
                     detailInvoice = null
                 },
                 onDelete = { deleteInvoice = invoice }
@@ -285,7 +456,386 @@ private fun PosGasApp(vm: MobileViewModel) {
 }
 
 @Composable
-private fun LoginScreen(onSelectUser: (String) -> Unit) {
+private fun AccountHistoryDialog(vm: MobileViewModel, account: String, onClose: () -> Unit) {
+    val today = remember { Calendar.getInstance(accountTimeZone) }
+    val currentYear = today.get(Calendar.YEAR)
+    var year by rememberSaveable(account) { mutableStateOf(currentYear.toString()) }
+    val months = remember {
+        val locale = Locale("es", "NI")
+        DateFormatSymbols.getInstance(locale).months.take(12).map { name ->
+            name.replaceFirstChar { it.titlecase(locale) }
+        }
+    }
+    var month by rememberSaveable(account) { mutableStateOf(months[today.get(Calendar.MONTH)]) }
+    var queriedYear by rememberSaveable(account) { mutableStateOf(currentYear) }
+    var queriedMonth by rememberSaveable(account) { mutableStateOf(today.get(Calendar.MONTH) + 1) }
+    val validYear = year.toIntOrNull()?.takeIf { it in 1900..9999 }
+    LaunchedEffect(account, queriedYear, queriedMonth) {
+        vm.loadAccounts(account, queriedMonth, queriedYear)
+    }
+    Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+        Surface(modifier = Modifier.fillMaxSize(), color = Bg, contentColor = TextMain) {
+            LazyColumn(
+                contentPadding = PaddingValues(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                item {
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Text("Movimientos · $account", Modifier.weight(1f), style = MaterialTheme.typography.titleLarge)
+                        TextButton(onClick = onClose) { Text("Volver") }
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        SelectField(month, "Mes", months, { month = it }, Modifier.weight(1f), readOnly = true)
+                        OutlinedTextField(
+                            value = year,
+                            onValueChange = { year = it.filter(Char::isDigit).take(4) },
+                            label = { Text("Año") },
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                            singleLine = true,
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                    TextButton(enabled = validYear != null && !vm.accountLoading, onClick = {
+                        if (validYear != null) {
+                            val selectedMonth = months.indexOf(month) + 1
+                            if (queriedMonth == selectedMonth && queriedYear == validYear) {
+                                vm.loadAccounts(account, queriedMonth, queriedYear)
+                            } else {
+                                queriedMonth = selectedMonth
+                                queriedYear = validYear
+                            }
+                        }
+                    }) {
+                        Text("Consultar")
+                    }
+                }
+                if (vm.accountLoading) {
+                    item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
+                }
+                vm.accountError?.let { message -> item { Text(message, color = TextSoft) } }
+                if (!vm.accountLoading && vm.accountError == null && vm.accountMovements.isEmpty()) {
+                    item { Text("Sin movimientos en ${months[queriedMonth - 1]} de $queriedYear", color = TextSoft) }
+                }
+                items(vm.accountMovements) { movement -> AccountMovementCard(movement) }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AccountMovementCard(movement: AccountMovement) {
+    val sign = if (movement.credit) "+" else "−"
+    val amount = if (movement.currency.equals("USD", true)) "USD %.2f".format(Locale.US, movement.amount)
+        else money(movement.amount)
+    Card(colors = CardDefaults.cardColors(containerColor = Panel2), modifier = Modifier.fillMaxWidth()) {
+        Row(
+            Modifier.padding(14.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text(movement.type.replace('_', ' '), fontWeight = FontWeight.SemiBold)
+                Text(movement.date, color = TextSoft, style = MaterialTheme.typography.bodySmall)
+                if (movement.note.isNotBlank()) Text(movement.note)
+                if (movement.reference.isNotBlank()) Text(movement.reference, color = TextSoft)
+                if (movement.status.isNotBlank() && !movement.status.equals("ACTIVA", true)) {
+                    Text(movement.status, color = TextSoft)
+                }
+            }
+            Text("$sign$amount", color = if (movement.credit) Ok else Brand, fontWeight = FontWeight.Bold)
+        }
+    }
+}
+
+@Composable
+private fun MovementDialog(
+    vm: MobileViewModel,
+    account: String,
+    type: String,
+    onDismiss: () -> Unit,
+    onSaved: () -> Unit
+) {
+    val transfer = type == "Transferencia entre cuentas"
+    val kind = if (transfer) "TRANSFERENCIA" else "DEVOLUCION"
+    var amount by rememberSaveable { mutableStateOf("") }
+    var destination by rememberSaveable { mutableStateOf("") }
+    var note by rememberSaveable { mutableStateOf("") }
+    var cash by remember { mutableStateOf(InvoiceFormState()) }
+    val requestId = rememberSaveable { UUID.randomUUID().toString() }
+    val cashRequired = account == "Caja" || destination == "Caja"
+    val denominations = cash.cashDetail.mapValues { it.value.toIntOrNull() ?: 0 }.filterValues { it > 0 }
+    val cashTotal = denominations.entries.sumOf { (value, count) -> value.toDouble() * count }
+    val parsedAmount = amount.replace(',', '.').toDoubleOrNull()
+    val canSave = parsedAmount != null && parsedAmount.isFinite() && parsedAmount > 0 &&
+        (!transfer || destination.isNotBlank()) &&
+        (!cashRequired || kotlin.math.abs(cashTotal - parsedAmount) < 0.005)
+    AlertDialog(
+        onDismissRequest = { if (!vm.saving) onDismiss() },
+        title = { Text("$type · $account") },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (transfer) {
+                    Text("Cuenta destino", style = MaterialTheme.typography.labelLarge)
+                    Accounts.filterNot { it == account }.forEach { target ->
+                        AccountActionButton(
+                            label = target,
+                            icon = Icons.AutoMirrored.Filled.ExitToApp,
+                            selected = destination == target,
+                            onClick = { if (!vm.saving) destination = target },
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+                }
+                MoneyField(amount, "Monto en C$", { amount = it }, Modifier.fillMaxWidth())
+                Field(note, "Referencia (opcional)", { note = it }, Modifier.fillMaxWidth())
+                if (cashRequired) CashDenominationPanel(cash, cashTotal) { cash = it }
+                vm.error?.let { Text(it, color = Brand) }
+            }
+        },
+        confirmButton = {
+            Button(
+                enabled = canSave && !vm.saving,
+                onClick = {
+                    parsedAmount?.let { vm.recordMovement(account, kind, destination, it, note, denominations, requestId, onSaved) }
+                }
+            ) { Text(if (vm.saving) "Guardando…" else "Registrar") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss, enabled = !vm.saving) { Text("Cancelar") } }
+    )
+}
+
+@Composable
+private fun CompactInvoiceForm(
+    vm: MobileViewModel,
+    account: String?,
+    onCatalog: (String) -> Unit,
+    onSaved: () -> Unit = {}
+) {
+    val form = vm.form
+    val concepts = vm.catalogEntries["conceptos"].orEmpty().filter { it.active }.map { it.name }
+    Card(modifier = Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = Panel)) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(account?.let { "Registrar factura · $it" } ?: "Registrar factura", style = MaterialTheme.typography.titleMedium)
+            if (account == null) {
+                SelectField(form.sourceFunds, "Cuenta de salida", Accounts, vm::selectInvoiceAccount, readOnly = true)
+            }
+            Field(form.supplier, "Proveedor", vm::updateSupplierQuery, Modifier.fillMaxWidth())
+            vm.supplierMatches.takeIf { form.supplier.isNotBlank() }.orEmpty().forEach { supplier ->
+                if (supplier.name != form.supplier) {
+                    TextButton(onClick = { vm.selectSupplier(supplier) }) { Text(supplier.name) }
+                }
+            }
+            TextButton(onClick = { onCatalog("proveedores") }, enabled = !vm.saving) { Text("Gestionar proveedores") }
+            Field(form.number, "Número de factura (opcional)", { vm.updateForm(form.copy(number = it)) }, Modifier.fillMaxWidth())
+            MoneyField(form.amount, "Monto en C$", { vm.updateForm(form.copy(amount = it.replace(',', '.'))) }, Modifier.fillMaxWidth())
+            SelectField(form.concept, "Concepto", concepts, { vm.updateForm(form.copy(concept = it)) }, readOnly = true)
+            TextButton(onClick = { onCatalog("conceptos") }, enabled = !vm.saving) { Text("Gestionar conceptos") }
+            Field(form.notes, "Referencia o comentario (opcional)", { vm.updateForm(form.copy(notes = it)) }, Modifier.fillMaxWidth())
+            if (form.sourceFunds == "Caja") CashDenominationPanel(form, vm.cashTotal, vm::updateForm)
+            vm.error?.let { Text(it, color = Brand) }
+            Button(
+                enabled = !vm.saving && form.concept in concepts,
+                onClick = { vm.saveInvoice(compact = true, onSaved = onSaved) }
+            ) { Text(if (vm.saving) "Guardando…" else "Guardar factura") }
+        }
+    }
+}
+
+@Composable
+private fun CatalogDialog(vm: MobileViewModel, entity: String, onDismiss: () -> Unit) {
+    var entry by remember { mutableStateOf<Supplier?>(null) }
+    var name by rememberSaveable { mutableStateOf("") }
+    var loaded by remember { mutableStateOf(false) }
+    LaunchedEffect(entity) { vm.loadCatalog(entity) { loaded = true } }
+    val error = vm.catalogErrors[entity]
+    val entries = vm.catalogEntries[entity].orEmpty()
+    val selected = entry
+    val label = if (entity == "proveedores") "Proveedores" else "Conceptos"
+    AlertDialog(
+        onDismissRequest = { if (!vm.saving) onDismiss() },
+        title = { Text(label) },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (loaded) {
+                    entries.forEach { item ->
+                        OutlinedButton(
+                            onClick = { entry = item; name = item.name },
+                            enabled = !vm.saving,
+                            modifier = Modifier.fillMaxWidth()
+                        ) { Text(if (item.active) item.name else "${item.name} (inactivo)") }
+                    }
+                    Field(name, if (selected == null) "Nuevo nombre" else "Editar nombre", { name = it }, Modifier.fillMaxWidth())
+                    if (selected != null) {
+                        TextButton(onClick = { entry = null; name = "" }, enabled = !vm.saving) { Text("Nuevo registro") }
+                        OutlinedButton(
+                            onClick = {
+                                vm.saveCatalogEntry(entity, selected, selected.name, !selected.active) {
+                                    entry = null
+                                    name = ""
+                                }
+                            },
+                            enabled = !vm.saving
+                        ) { Text(if (selected.active) "Desactivar" else "Reactivar") }
+                    }
+                } else if (error == null) {
+                    LinearProgressIndicator(Modifier.fillMaxWidth())
+                }
+                error?.let { Text(it, color = Brand) }
+            }
+        },
+        confirmButton = {
+            Button(enabled = loaded && !vm.saving && name.isNotBlank(), onClick = {
+                vm.saveCatalogEntry(entity, selected, name, selected?.active ?: true) {
+                    entry = null
+                    name = ""
+                }
+            }) { Text(if (selected == null) "Crear" else "Guardar cambios") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss, enabled = !vm.saving) { Text("Cerrar") } }
+    )
+}
+
+@Composable
+private fun AccountCard(
+    account: String,
+    balance: AccountBalance?,
+    expanded: Boolean,
+    selectedAction: String?,
+    onToggle: () -> Unit,
+    onAction: (String) -> Unit
+) {
+    val interactionSource = remember { MutableInteractionSource() }
+    val pressed by interactionSource.collectIsPressedAsState()
+    val hovered by interactionSource.collectIsHoveredAsState()
+    val focused by interactionSource.collectIsFocusedAsState()
+    val headerColor = when {
+        pressed -> lerp(Panel, Brand, 0.36f)
+        hovered || focused -> lerp(Panel, Brand, 0.20f)
+        expanded -> lerp(Panel, Brand, 0.12f)
+        else -> Panel
+    }
+    val accountIcon = when (account) {
+        "Banco" -> R.drawable.ic_account_bank
+        "Caja chica" -> R.drawable.ic_account_wallet
+        else -> R.drawable.ic_account_register
+    }
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(containerColor = Panel),
+        border = BorderStroke(1.dp, Brand.copy(alpha = if (expanded || hovered || focused || pressed) 1f else 0.65f))
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(headerColor)
+                .clickable(
+                    interactionSource = interactionSource,
+                    indication = LocalIndication.current,
+                    role = Role.Button,
+                    onClickLabel = if (expanded) "Ocultar opciones" else "Mostrar opciones",
+                    onClick = onToggle
+                )
+                .semantics { stateDescription = if (expanded) "Expandida" else "Contraída" }
+                .padding(14.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(
+                modifier = Modifier.size(40.dp)
+                    .background(lerp(Panel, Brand, 0.19f), RoundedCornerShape(10.dp)),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(painterResource(accountIcon), contentDescription = null, tint = Brand)
+            }
+            Text(account, modifier = Modifier.weight(1f), color = TextMain, fontWeight = FontWeight.Bold)
+            Column(horizontalAlignment = Alignment.End) {
+                Text(
+                    balance?.let { money(it.cordobas) } ?: "Saldo no disponible",
+                    color = if (balance == null) TextSoft else TextMain,
+                    style = MaterialTheme.typography.labelMedium,
+                    textAlign = TextAlign.End
+                )
+                if (balance != null && balance.dollars != 0.0) {
+                    Text("USD %.2f".format(Locale.US, balance.dollars), color = TextSoft, style = MaterialTheme.typography.labelSmall)
+                }
+            }
+            Icon(
+                Icons.Default.KeyboardArrowDown,
+                contentDescription = null,
+                modifier = Modifier.rotate(if (expanded) 180f else 0f),
+                tint = Brand
+            )
+        }
+        if (expanded) {
+            HorizontalDivider(color = Brand.copy(alpha = 0.30f))
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(10.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                val actions = buildList {
+                    add("Detalles" to Icons.AutoMirrored.Filled.List)
+                    if (account != "Banco") add("Ingresos" to Icons.Default.AddCircle)
+                    add("Salida" to Icons.AutoMirrored.Filled.ExitToApp)
+                }
+                actions.forEach { (label, icon) ->
+                    AccountActionButton(
+                        label = label,
+                        icon = icon,
+                        selected = selectedAction == label,
+                        onClick = { onAction(label) },
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AccountActionButton(
+    label: String,
+    icon: ImageVector,
+    selected: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val interactionSource = remember { MutableInteractionSource() }
+    val pressed by interactionSource.collectIsPressedAsState()
+    val hovered by interactionSource.collectIsHoveredAsState()
+    val focused by interactionSource.collectIsFocusedAsState()
+    val filled = pressed || selected
+    val background = when {
+        pressed -> Brand2
+        selected -> Brand
+        hovered || focused -> lerp(Panel2, Brand, 0.25f)
+        else -> Panel2
+    }
+
+    OutlinedButton(
+        onClick = onClick,
+        modifier = modifier,
+        interactionSource = interactionSource,
+        shape = RoundedCornerShape(10.dp),
+        border = BorderStroke(1.dp, Brand.copy(alpha = if (filled || hovered || focused) 1f else 0.55f)),
+        colors = ButtonDefaults.outlinedButtonColors(
+            containerColor = background,
+            contentColor = if (filled) Bg else TextMain
+        ),
+        contentPadding = PaddingValues(horizontal = 4.dp, vertical = 9.dp)
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            Icon(icon, contentDescription = null, modifier = Modifier.size(20.dp), tint = if (filled) Bg else Brand)
+            Text(label, textAlign = TextAlign.Center)
+        }
+    }
+}
+
+@Composable
+private fun LoginScreen(vm: MobileViewModel, onAuthorize: () -> Unit) {
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -299,15 +849,12 @@ private fun LoginScreen(onSelectUser: (String) -> Unit) {
             colors = CardDefaults.cardColors(containerColor = Panel)
         ) {
             Column(modifier = Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                Text("Registro de Facturas", color = TextMain, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-                Text("Selecciona quien va a registrar", color = TextSoft)
-                listOf("Ruth", "Luis", "Iris", "Alma").forEach { user ->
-                    Button(
-                        onClick = { onSelectUser(user) },
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text(user)
-                    }
+                Text("Grano y Alma", color = TextMain, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                Text("Usa la cuenta Google de un operador activo.", color = TextSoft)
+                if (!vm.apiReady) Text("Falta configurar el despliegue y los permisos de la API.", color = TextSoft)
+                vm.authorizationError?.let { Text(it, color = Brand) }
+                Button(onClick = onAuthorize, enabled = vm.apiReady && !vm.authorizing, modifier = Modifier.fillMaxWidth()) {
+                    Text(if (vm.authorizing) "Verificando…" else "Continuar con Google")
                 }
             }
         }
@@ -315,8 +862,9 @@ private fun LoginScreen(onSelectUser: (String) -> Unit) {
 }
 
 @Composable
-private fun AppDrawer(selected: String, onSelect: (String) -> Unit) {
+private fun AppDrawer(selected: String, onAuthorize: () -> Unit, onSelect: (String) -> Unit) {
     val sections = listOf(
+        "Cuentas",
         "Facturacion",
         "Inventario",
         "Dashboard",
@@ -337,6 +885,7 @@ private fun AppDrawer(selected: String, onSelect: (String) -> Unit) {
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             Text("Grano y Alma", color = TextMain, fontWeight = FontWeight.Bold)
             Text("POS Gas Mobile", color = Brand, style = MaterialTheme.typography.labelMedium)
+            TextButton(onClick = onAuthorize) { Text("Volver a autorizar Google") }
             HorizontalDivider(modifier = Modifier.padding(vertical = 10.dp), color = Panel3)
             sections.forEach { item ->
                 NavigationDrawerItem(
@@ -609,22 +1158,12 @@ private fun InvoiceForm(
                 { onChange(form.copy(referenceFund = it)) },
                 Modifier.fillMaxWidth()
             )
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                SelectField(
-                    value = form.category,
-                    label = "Categoria",
-                    options = webCategories(),
-                    onValueChange = { onChange(form.copy(category = it)) },
-                    modifier = Modifier.weight(1f)
-                )
-                SelectField(
-                    value = form.status,
-                    label = "Estado",
-                    options = listOf("Activa", "Anulada"),
-                    onValueChange = { onChange(form.copy(status = it)) },
-                    modifier = Modifier.weight(1f)
-                )
-            }
+            SelectField(
+                value = form.status,
+                label = "Estado",
+                options = listOf("Activa", "Anulada"),
+                onValueChange = { onChange(form.copy(status = it)) }
+            )
             if (form.usesCash()) {
                 CashDenominationPanel(
                     form = form,
@@ -782,12 +1321,13 @@ private fun MoneyField(value: String, label: String, onValueChange: (String) -> 
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun SelectField(
+internal fun SelectField(
     value: String,
     label: String,
     options: List<String>,
     onValueChange: (String) -> Unit,
-    modifier: Modifier = Modifier.fillMaxWidth()
+    modifier: Modifier = Modifier.fillMaxWidth(),
+    readOnly: Boolean = false
 ) {
     var expanded by remember { mutableStateOf(false) }
     ExposedDropdownMenuBox(
@@ -798,6 +1338,7 @@ private fun SelectField(
         OutlinedTextField(
             value = value,
             onValueChange = onValueChange,
+            readOnly = readOnly,
             label = { Text(label) },
             singleLine = true,
             trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded) },
@@ -891,10 +1432,11 @@ private fun InvoiceDetailDialog(
                 DetailLine("Concepto", invoice.concept)
                 DetailLine("Pagador", invoice.payer)
                 DetailLine("Medio", invoice.paymentMethod)
-                DetailLine("Categoria", invoice.category)
+                if (invoice.category.isNotBlank()) DetailLine("Categoría", invoice.category)
                 DetailLine("Fuente", invoice.sourceFunds)
                 DetailLine("Egreso C$", money(invoice.egresoCordobas))
                 DetailLine("Referencia", invoice.referenceFund)
+                if (invoice.notes.isNotBlank()) DetailLine("Comentario", invoice.notes)
                 DetailLine("Registrado por", invoice.registeredBy)
             }
         },
@@ -988,26 +1530,6 @@ private fun Double.formatStock(): String {
     return if (this == whole.toDouble()) whole.toString() else "%.2f".format(Locale.US, this)
 }
 
-private fun webCategories(): List<String> = listOf(
-    "Insumos",
-    "Reposicion de stock",
-    "Servicios",
-    "Equipamiento",
-    "Mobiliario",
-    "Mejoras del local",
-    "Tecnologia",
-    "Salarios",
-    "Impuestos",
-    "Permisos",
-    "Alquiler",
-    "Publicidad",
-    "Branding",
-    "Promociones",
-    "FONDO",
-    "AJUSTE",
-    "Varios"
-)
-
 private val cordobaFormat: NumberFormat = NumberFormat.getCurrencyInstance(Locale("es", "NI"))
 
-private fun money(value: Double): String = cordobaFormat.format(value)
+internal fun money(value: Double): String = cordobaFormat.format(value)
