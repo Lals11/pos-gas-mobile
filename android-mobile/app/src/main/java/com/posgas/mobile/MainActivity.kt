@@ -7,6 +7,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.LocalIndication
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -23,9 +24,11 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
@@ -47,6 +50,7 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExposedDropdownMenuBox
 import androidx.compose.material3.ExposedDropdownMenuDefaults
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
@@ -75,11 +79,16 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.rotate
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
@@ -106,6 +115,8 @@ import com.google.android.gms.auth.api.identity.AuthorizationRequest
 import com.google.android.gms.auth.api.identity.Identity
 import com.google.android.gms.common.api.Scope
 import kotlinx.coroutines.launch
+import org.json.JSONObject
+import java.io.File
 import java.text.NumberFormat
 import java.text.DateFormatSymbols
 import java.util.Calendar
@@ -136,7 +147,8 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
 
         vm = ViewModelProvider(this, Factory(BuildConfig.API_DEPLOYMENT_ID, MobileCache(this)))[MobileViewModel::class.java]
-        setContent { PosGasApp(vm, ::authorizeGoogle) }
+        val snapshot = if (BuildConfig.DEBUG) readAccountSnapshot(filesDir) else null
+        setContent { PosGasApp(vm, ::authorizeGoogle, snapshot) }
     }
 
     private fun authorizeGoogle() {
@@ -156,6 +168,21 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+private data class AccountSnapshot(val capturedAt: String, val balances: Map<String, AccountBalance>)
+
+private fun readAccountSnapshot(filesDir: File): AccountSnapshot? = runCatching {
+    val data = JSONObject(File(filesDir, "account-preview.json").readText())
+    val accounts = data.getJSONObject("balances")
+    val balances = Accounts.associateWith { account ->
+        val balance = accounts.getJSONObject(account)
+        val cs = balance.getDouble("cs")
+        val usd = balance.getDouble("usd")
+        require(cs.isFinite() && usd.isFinite())
+        AccountBalance(cs, usd)
+    }
+    AccountSnapshot(data.getString("capturedAt"), balances)
+}.getOrNull()
+
 class Factory(private val deploymentId: String, private val cache: MobileCache) : ViewModelProvider.Factory {
     override fun <T : ViewModel> create(modelClass: Class<T>): T {
         @Suppress("UNCHECKED_CAST")
@@ -165,7 +192,7 @@ class Factory(private val deploymentId: String, private val cache: MobileCache) 
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun PosGasApp(vm: MobileViewModel, onAuthorize: () -> Unit) {
+private fun PosGasApp(vm: MobileViewModel, onAuthorize: () -> Unit, snapshot: AccountSnapshot?) {
     val colors = MaterialTheme.colorScheme.copy(
         primary = Brand,
         secondary = Brand2,
@@ -179,9 +206,13 @@ private fun PosGasApp(vm: MobileViewModel, onAuthorize: () -> Unit) {
         if (vm.currentUser == null) {
             var preview by rememberSaveable { mutableStateOf(false) }
             if (BuildConfig.DEBUG && preview) {
-                AccountsDesignPreview(onBack = { preview = false })
+                AccountsDesignPreview(snapshot, onBack = { preview = false })
             } else {
-                LoginScreen(vm, onAuthorize, onPreview = if (BuildConfig.DEBUG) ({ preview = true }) else null)
+                LoginScreen(
+                    vm, onAuthorize,
+                    previewLabel = if (snapshot != null) "Ver saldos reales" else "Probar diseño",
+                    onPreview = if (BuildConfig.DEBUG) ({ preview = true }) else null
+                )
             }
             return@MaterialTheme
         }
@@ -285,20 +316,11 @@ private fun PosGasApp(vm: MobileViewModel, onAuthorize: () -> Unit) {
                                 onAction = { accountAction = it }
                             )
                         }
-                        if (accountAction != "Factura") {
-                            if (vm.accountLoading) item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
-                            vm.accountError?.let { message ->
-                                item {
-                                    Text(message, color = TextSoft)
-                                    TextButton(onClick = { vm.loadAccounts() }) { Text("Reintentar") }
-                                }
-                            }
-                        }
-                        if (accountAction == "Factura") {
+                        if (vm.accountLoading) item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
+                        vm.accountError?.let { message ->
                             item {
-                                CompactInvoiceForm(vm, expandedAccount, onCatalog = { catalog = it }) {
-                                    accountAction = "Detalles"
-                                }
+                                Text(message, color = TextSoft)
+                                TextButton(onClick = { vm.loadAccounts() }) { Text("Reintentar") }
                             }
                         }
                     } else if (selectedSection == "Inventario") {
@@ -378,17 +400,31 @@ private fun PosGasApp(vm: MobileViewModel, onAuthorize: () -> Unit) {
             }
         }
 
+        if (selectedSection == "Cuentas" && accountAction == "Factura") {
+            expandedAccount?.let { account ->
+                AccountInvoiceDialog(vm, account, onCatalog = { catalog = it }, onClose = { accountAction = null }) {
+                    accountAction = "Detalles"
+                }
+            }
+        }
+
         if (selectedSection == "Cuentas" && movementType == null && accountAction in listOf("Salida", "Ingresos")) {
             val isIncome = accountAction == "Ingresos"
             AlertDialog(
                 onDismissRequest = { accountAction = null },
                 title = { Text("${accountAction.orEmpty()} · ${expandedAccount.orEmpty()}") },
+                containerColor = Panel,
                 text = {
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         val options = if (isIncome) listOf("Venta", "Devolución")
                         else listOf("Transferencia entre cuentas", "Registro de factura")
-                        options.forEach { option ->
-                            OutlinedButton(
+                        options.forEachIndexed { index, option ->
+                            AccountActionButton(
+                                label = option,
+                                icon = if (index == 0 && !isIncome) Icons.AutoMirrored.Filled.ExitToApp
+                                    else if (index == 0) Icons.Default.AddCircle else Icons.AutoMirrored.Filled.List,
+                                selected = false,
+                                minHeight = 76.dp,
                                 onClick = {
                                     vm.clearError()
                                     if (option == "Registro de factura") {
@@ -400,7 +436,7 @@ private fun PosGasApp(vm: MobileViewModel, onAuthorize: () -> Unit) {
                                     } else movementType = option
                                 },
                                 modifier = Modifier.fillMaxWidth()
-                            ) { Text(option) }
+                            )
                         }
                     }
                 },
@@ -475,6 +511,13 @@ private fun AccountHistoryDialog(vm: MobileViewModel, account: String, onClose: 
     var month by rememberSaveable(account) { mutableStateOf(months[today.get(Calendar.MONTH)]) }
     var queriedYear by rememberSaveable(account) { mutableStateOf(currentYear) }
     var queriedMonth by rememberSaveable(account) { mutableStateOf(today.get(Calendar.MONTH) + 1) }
+    var recentLimit by rememberSaveable(account, queriedYear, queriedMonth) { mutableStateOf(10) }
+    val monthDays = remember(queriedYear, queriedMonth) {
+        Calendar.getInstance(accountTimeZone).apply { set(queriedYear, queriedMonth - 1, 1) }
+            .getActualMaximum(Calendar.DAY_OF_MONTH)
+    }
+    val movements = vm.accountMovements
+    val recent = remember(account, movements) { if (account == "Caja") summarizeDailySales(movements) else movements }
     val validYear = year.toIntOrNull()?.takeIf { it in 1900..9999 }
     LaunchedEffect(account, queriedYear, queriedMonth) {
         vm.loadAccounts(account, queriedMonth, queriedYear)
@@ -519,12 +562,92 @@ private fun AccountHistoryDialog(vm: MobileViewModel, account: String, onClose: 
                     item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
                 }
                 vm.accountError?.let { message -> item { Text(message, color = TextSoft) } }
-                if (!vm.accountLoading && vm.accountError == null && vm.accountMovements.isEmpty()) {
+                if (!vm.accountLoading && vm.accountError == null && movements.isEmpty()) {
                     item { Text("Sin movimientos en ${months[queriedMonth - 1]} de $queriedYear", color = TextSoft) }
                 }
-                items(vm.accountMovements) { movement -> AccountMovementCard(movement) }
+                if (movements.isNotEmpty() && vm.accountError == null) {
+                    item { AccountChangeChart(movements, monthDays) }
+                    item { Text("Movimientos recientes", style = MaterialTheme.typography.titleMedium) }
+                    items(recent.take(recentLimit)) { movement -> AccountMovementCard(movement) }
+                    if (recent.size > recentLimit) {
+                        item { TextButton(onClick = { recentLimit += 10 }) { Text("Ver más movimientos") } }
+                    }
+                }
             }
         }
+    }
+}
+
+@Composable
+private fun AccountChangeChart(movements: List<AccountMovement>, days: Int) {
+    val active = remember(movements) { movements.filter { it.isActive } }
+    val hasDollars = active.any { it.currency.equals("USD", true) }
+    var selected by rememberSaveable { mutableStateOf("C$") }
+    val currency = if (hasDollars) selected else "C$"
+    val values = remember(active, days, currency) {
+        DoubleArray(days).apply {
+            active.filter { it.currency.equals("USD", true) == (currency == "USD") }.forEach { movement ->
+                val day = movement.day
+                if (day != null && day in 1..days) this[day - 1] += if (movement.credit) movement.amount else -movement.amount
+            }
+        }
+    }
+    val scale = values.maxOf { kotlin.math.abs(it) }.coerceAtLeast(1.0)
+    val total = values.sum()
+    Card(colors = CardDefaults.cardColors(containerColor = Panel2), modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("Cambio neto por día", style = MaterialTheme.typography.titleMedium, color = TextMain)
+            Text("Neto del mes · ${cashLabel(currency, total)}", color = TextSoft)
+            if (hasDollars) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf("C$", "USD").forEach { unit ->
+                        FilterChip(selected = currency == unit, onClick = { selected = unit }, label = { Text(unit) })
+                    }
+                }
+            }
+            Canvas(Modifier.fillMaxWidth().height(116.dp).semantics {
+                contentDescription = "Cambios diarios en $currency. Verde: subió. Naranja: bajó."
+            }) {
+                val zero = size.height / 2
+                val slot = size.width / days
+                drawLine(TextSoft.copy(alpha = 0.5f), Offset(0f, zero), Offset(size.width, zero))
+                values.forEachIndexed { index, value ->
+                    if (value == 0.0) return@forEachIndexed
+                    val height = (kotlin.math.abs(value) / scale * (zero - 2.dp.toPx())).toFloat().coerceAtLeast(1f)
+                    drawRect(
+                        color = if (value > 0) Ok else Brand,
+                        topLeft = Offset(slot * (index + 0.2f), if (value > 0) zero - height else zero),
+                        size = Size(slot * 0.6f, height)
+                    )
+                }
+            }
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Text("Día 1", color = TextSoft, style = MaterialTheme.typography.labelSmall)
+                Text("Día $days", color = TextSoft, style = MaterialTheme.typography.labelSmall)
+            }
+        }
+    }
+}
+
+private val AccountMovement.isActive: Boolean
+    get() = status.isBlank() || status.equals("ACTIVA", true)
+
+private fun summarizeDailySales(movements: List<AccountMovement>): List<AccountMovement> {
+    val sales = movements.filter { it.credit && it.type.equals("VENTA", true) && it.day != null }
+        .groupBy { it.day }
+    val shown = mutableSetOf<Int>()
+    return movements.mapNotNull { movement ->
+        val day = movement.day
+        if (day == null || !movement.credit || !movement.type.equals("VENTA", true)) return@mapNotNull movement
+        if (!shown.add(day)) return@mapNotNull null
+        val active = sales.getValue(day).filter { it.isActive }
+        if (active.isEmpty()) return@mapNotNull null
+        val total = active.sumOf { it.amountCordobas }
+        movement.copy(
+            date = movement.date.substringBefore(' '), type = "Ventas del día", amount = total,
+            amountCordobas = total, currency = "C$", reference = "", status = "ACTIVA",
+            note = if (active.size == 1) "1 venta" else "${active.size} ventas"
+        )
     }
 }
 
@@ -564,6 +687,7 @@ private fun MovementDialog(
     val kind = if (transfer) "TRANSFERENCIA" else "DEVOLUCION"
     var amount by rememberSaveable { mutableStateOf("") }
     var destination by rememberSaveable { mutableStateOf("") }
+    var currency by rememberSaveable { mutableStateOf("C$") }
     var note by rememberSaveable { mutableStateOf("") }
     var cash by remember { mutableStateOf(InvoiceFormState()) }
     val requestId = rememberSaveable { UUID.randomUUID().toString() }
@@ -586,12 +710,30 @@ private fun MovementDialog(
                             label = target,
                             icon = Icons.AutoMirrored.Filled.ExitToApp,
                             selected = destination == target,
-                            onClick = { if (!vm.saving) destination = target },
+                            onClick = {
+                                if (!vm.saving && target != destination) {
+                                    destination = target
+                                    if (target == "Banco" && currency == "USD") {
+                                        currency = "C$"
+                                        amount = ""
+                                    }
+                                    cash = InvoiceFormState(currency = currency)
+                                }
+                            },
                             modifier = Modifier.fillMaxWidth()
                         )
                     }
                 }
-                MoneyField(amount, "Monto en C$", { amount = it }, Modifier.fillMaxWidth())
+                if (transfer && account != "Banco" && destination != "Banco") {
+                    SelectField(currency, "Moneda", listOf("C$", "USD"), { unit ->
+                        if (unit != currency) {
+                            currency = unit
+                            amount = ""
+                            cash = InvoiceFormState(currency = unit)
+                        }
+                    }, readOnly = true)
+                }
+                MoneyField(amount, "Monto en $currency", { amount = it }, Modifier.fillMaxWidth())
                 Field(note, "Referencia (opcional)", { note = it }, Modifier.fillMaxWidth())
                 if (cashRequired) CashDenominationPanel(cash, cashTotal) { cash = it }
                 vm.error?.let { Text(it, color = Brand) }
@@ -601,7 +743,7 @@ private fun MovementDialog(
             Button(
                 enabled = canSave && !vm.saving,
                 onClick = {
-                    parsedAmount?.let { vm.recordMovement(account, kind, destination, it, note, denominations, requestId, onSaved) }
+                    parsedAmount?.let { vm.recordMovement(account, kind, destination, it, currency, note, denominations, requestId, onSaved) }
                 }
             ) { Text(if (vm.saving) "Guardando…" else "Registrar") }
         },
@@ -610,18 +752,59 @@ private fun MovementDialog(
 }
 
 @Composable
+private fun AccountInvoiceDialog(
+    vm: MobileViewModel,
+    account: String,
+    onCatalog: (String) -> Unit,
+    onClose: () -> Unit,
+    onSaved: () -> Unit
+) {
+    val maxHeight = LocalConfiguration.current.screenHeightDp.dp * 0.92f
+    Dialog(
+        onDismissRequest = { if (!vm.saving) onClose() },
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Surface(
+            modifier = Modifier.widthIn(max = 680.dp).fillMaxWidth(0.94f).heightIn(max = maxHeight),
+            shape = RoundedCornerShape(22.dp), color = Panel, contentColor = TextMain,
+            border = BorderStroke(1.5.dp, Brand.copy(alpha = 0.85f))
+        ) {
+            Column {
+                Text(
+                    "Registrar factura · $account", style = MaterialTheme.typography.titleLarge,
+                    modifier = Modifier.padding(start = 20.dp, top = 18.dp, end = 20.dp, bottom = 4.dp)
+                )
+                Column(Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState())) {
+                    CompactInvoiceForm(vm, account, onCatalog, showSaveButton = false)
+                }
+                HorizontalDivider(color = Brand.copy(alpha = 0.35f))
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    TextButton(onClick = onClose, enabled = !vm.saving) { Text("Cancelar") }
+                    CompactInvoiceSaveButton(vm, onSaved)
+                }
+            }
+        }
+    }
+}
+
+@Composable
 private fun CompactInvoiceForm(
     vm: MobileViewModel,
     account: String?,
     onCatalog: (String) -> Unit,
+    showSaveButton: Boolean = true,
     onSaved: () -> Unit = {}
 ) {
     val form = vm.form
     val concepts = vm.catalogEntries["conceptos"].orEmpty().filter { it.active }.map { it.name }
     Card(modifier = Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = Panel)) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text(account?.let { "Registrar factura · $it" } ?: "Registrar factura", style = MaterialTheme.typography.titleMedium)
             if (account == null) {
+                Text("Registrar factura", style = MaterialTheme.typography.titleMedium)
                 SelectField(form.sourceFunds, "Cuenta de salida", Accounts, vm::selectInvoiceAccount, readOnly = true)
             }
             Field(form.supplier, "Proveedor", vm::updateSupplierQuery, Modifier.fillMaxWidth())
@@ -632,17 +815,29 @@ private fun CompactInvoiceForm(
             }
             TextButton(onClick = { onCatalog("proveedores") }, enabled = !vm.saving) { Text("Gestionar proveedores") }
             Field(form.number, "Número de factura (opcional)", { vm.updateForm(form.copy(number = it)) }, Modifier.fillMaxWidth())
-            MoneyField(form.amount, "Monto en C$", { vm.updateForm(form.copy(amount = it.replace(',', '.'))) }, Modifier.fillMaxWidth())
+            if (form.sourceFunds != "Banco") {
+                SelectField(form.currency, "Moneda", listOf("C$", "USD"), { unit ->
+                    if (unit != form.currency) vm.updateForm(form.copy(
+                        currency = unit, amount = "", cashDetail = emptyMap(), egresoCordobas = ""
+                    ))
+                }, readOnly = true)
+            }
+            MoneyField(form.amount, "Monto en ${form.currency}", { vm.updateForm(form.copy(amount = it.replace(',', '.'))) }, Modifier.fillMaxWidth())
             SelectField(form.concept, "Concepto", concepts, { vm.updateForm(form.copy(concept = it)) }, readOnly = true)
             TextButton(onClick = { onCatalog("conceptos") }, enabled = !vm.saving) { Text("Gestionar conceptos") }
             Field(form.notes, "Referencia o comentario (opcional)", { vm.updateForm(form.copy(notes = it)) }, Modifier.fillMaxWidth())
             if (form.sourceFunds == "Caja") CashDenominationPanel(form, vm.cashTotal, vm::updateForm)
             vm.error?.let { Text(it, color = Brand) }
-            Button(
-                enabled = !vm.saving && form.concept in concepts,
-                onClick = { vm.saveInvoice(compact = true, onSaved = onSaved) }
-            ) { Text(if (vm.saving) "Guardando…" else "Guardar factura") }
+            if (showSaveButton) CompactInvoiceSaveButton(vm, onSaved)
         }
+    }
+}
+
+@Composable
+private fun CompactInvoiceSaveButton(vm: MobileViewModel, onSaved: () -> Unit) {
+    val validConcept = vm.catalogEntries["conceptos"].orEmpty().any { it.active && it.name == vm.form.concept }
+    Button(enabled = !vm.saving && validConcept, onClick = { vm.saveInvoice(compact = true, onSaved = onSaved) }) {
+        Text(if (vm.saving) "Guardando…" else "Guardar factura")
     }
 }
 
@@ -709,6 +904,12 @@ private fun AccountCard(
     onToggle: () -> Unit,
     onAction: (String) -> Unit
 ) {
+    val window = LocalConfiguration.current
+    val wide = window.screenWidthDp >= 600
+    val heightFraction = if (wide) 0.22f else 0.185f
+    val minHeaderHeight = (window.screenHeightDp.dp * heightFraction)
+        .coerceIn(if (wide) 136.dp else 104.dp, 240.dp)
+    val horizontalPadding = if (wide) 28.dp else 16.dp
     val interactionSource = remember { MutableInteractionSource() }
     val pressed by interactionSource.collectIsPressedAsState()
     val hovered by interactionSource.collectIsHoveredAsState()
@@ -727,14 +928,15 @@ private fun AccountCard(
 
     Card(
         modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(16.dp),
+        shape = RoundedCornerShape(20.dp),
         colors = CardDefaults.cardColors(containerColor = Panel),
         border = BorderStroke(1.dp, Brand.copy(alpha = if (expanded || hovered || focused || pressed) 1f else 0.65f))
     ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .background(headerColor)
+                .heightIn(min = minHeaderHeight)
+                .background(Brush.horizontalGradient(listOf(lerp(headerColor, Brand, 0.07f), headerColor)))
                 .clickable(
                     interactionSource = interactionSource,
                     indication = LocalIndication.current,
@@ -743,40 +945,46 @@ private fun AccountCard(
                     onClick = onToggle
                 )
                 .semantics { stateDescription = if (expanded) "Expandida" else "Contraída" }
-                .padding(14.dp),
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
+                .padding(horizontal = horizontalPadding, vertical = 16.dp),
+            horizontalArrangement = Arrangement.spacedBy(if (wide) 22.dp else 14.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Box(
-                modifier = Modifier.size(40.dp)
-                    .background(lerp(Panel, Brand, 0.19f), RoundedCornerShape(10.dp)),
+                modifier = Modifier.size(if (wide) 72.dp else 54.dp)
+                    .background(lerp(Panel, Brand, 0.19f), RoundedCornerShape(16.dp)),
                 contentAlignment = Alignment.Center
             ) {
-                Icon(painterResource(accountIcon), contentDescription = null, tint = Brand)
+                Icon(
+                    painterResource(accountIcon), contentDescription = null,
+                    modifier = Modifier.size(if (wide) 38.dp else 28.dp), tint = Brand
+                )
             }
-            Text(account, modifier = Modifier.weight(1f), color = TextMain, fontWeight = FontWeight.Bold)
-            Column(horizontalAlignment = Alignment.End) {
+            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text(account, color = TextSoft, style = MaterialTheme.typography.titleMedium)
                 Text(
                     balance?.let { money(it.cordobas) } ?: "Saldo no disponible",
                     color = if (balance == null) TextSoft else TextMain,
-                    style = MaterialTheme.typography.labelMedium,
-                    textAlign = TextAlign.End
+                    style = if (wide) MaterialTheme.typography.headlineMedium else MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.SemiBold
                 )
-                if (balance != null && balance.dollars != 0.0) {
-                    Text("USD %.2f".format(Locale.US, balance.dollars), color = TextSoft, style = MaterialTheme.typography.labelSmall)
+                if (account != "Banco" && balance != null && balance.dollars != 0.0) {
+                    Text(
+                        "USD %,.2f".format(Locale.US, balance.dollars),
+                        color = TextSoft, style = MaterialTheme.typography.bodyMedium
+                    )
                 }
             }
             Icon(
                 Icons.Default.KeyboardArrowDown,
                 contentDescription = null,
-                modifier = Modifier.rotate(if (expanded) 180f else 0f),
+                modifier = Modifier.size(if (wide) 32.dp else 24.dp).rotate(if (expanded) 180f else 0f),
                 tint = Brand
             )
         }
         if (expanded) {
             HorizontalDivider(color = Brand.copy(alpha = 0.30f))
             Row(
-                modifier = Modifier.fillMaxWidth().padding(10.dp),
+                modifier = Modifier.fillMaxWidth().padding(if (wide) 16.dp else 10.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 val actions = buildList {
@@ -804,7 +1012,8 @@ private fun AccountActionButton(
     icon: ImageVector,
     selected: Boolean,
     onClick: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    minHeight: androidx.compose.ui.unit.Dp = 56.dp
 ) {
     val interactionSource = remember { MutableInteractionSource() }
     val pressed by interactionSource.collectIsPressedAsState()
@@ -820,15 +1029,15 @@ private fun AccountActionButton(
 
     OutlinedButton(
         onClick = onClick,
-        modifier = modifier,
+        modifier = modifier.heightIn(min = minHeight),
         interactionSource = interactionSource,
         shape = RoundedCornerShape(10.dp),
-        border = BorderStroke(1.dp, Brand.copy(alpha = if (filled || hovered || focused) 1f else 0.55f)),
+        border = BorderStroke(1.5.dp, Brand.copy(alpha = if (filled || hovered || focused) 1f else 0.80f)),
         colors = ButtonDefaults.outlinedButtonColors(
             containerColor = background,
             contentColor = if (filled) Bg else TextMain
         ),
-        contentPadding = PaddingValues(horizontal = 4.dp, vertical = 9.dp)
+        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 10.dp)
     ) {
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
@@ -841,12 +1050,12 @@ private fun AccountActionButton(
 }
 
 @Composable
-private fun AccountsDesignPreview(onBack: () -> Unit) {
+private fun AccountsDesignPreview(snapshot: AccountSnapshot?, onBack: () -> Unit) {
     var expandedAccount by rememberSaveable { mutableStateOf<String?>(null) }
     var selectedAction by rememberSaveable { mutableStateOf<String?>(null) }
-    val sampleBalances = remember {
+    val balances = snapshot?.balances ?: remember {
         mapOf(
-            "Banco" to AccountBalance(24500.0, 150.0),
+            "Banco" to AccountBalance(24500.0, 0.0),
             "Caja chica" to AccountBalance(1350.0, 0.0),
             "Caja" to AccountBalance(4260.0, 20.0)
         )
@@ -860,12 +1069,13 @@ private fun AccountsDesignPreview(onBack: () -> Unit) {
         item {
             TextButton(onClick = onBack) { Text("Volver al inicio") }
             Text("Cuentas", style = MaterialTheme.typography.titleLarge, color = TextMain)
-            Text("Vista de prueba · Saldos de ejemplo", color = Brand)
+            Text(snapshot?.let { "Saldos reales · Lectura del ${it.capturedAt}" }
+                ?: "Vista de prueba · Saldos de ejemplo", color = Brand)
         }
         items(Accounts, key = { it }) { account ->
             AccountCard(
                 account = account,
-                balance = sampleBalances.getValue(account),
+                balance = balances.getValue(account),
                 expanded = expandedAccount == account,
                 selectedAction = selectedAction.takeIf { expandedAccount == account },
                 onToggle = {
@@ -876,13 +1086,22 @@ private fun AccountsDesignPreview(onBack: () -> Unit) {
             )
         }
         if (selectedAction != null) {
-            item { Text("$selectedAction · $expandedAccount. Conecta tu cuenta para usar esta opción.", color = TextSoft) }
+            item {
+                val message = if (snapshot != null) "Vista de saldos de solo lectura."
+                    else "Conecta tu cuenta para usar esta opción."
+                Text("$selectedAction · $expandedAccount. $message", color = TextSoft)
+            }
         }
     }
 }
 
 @Composable
-private fun LoginScreen(vm: MobileViewModel, onAuthorize: () -> Unit, onPreview: (() -> Unit)?) {
+private fun LoginScreen(
+    vm: MobileViewModel,
+    onAuthorize: () -> Unit,
+    previewLabel: String,
+    onPreview: (() -> Unit)?
+) {
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -905,7 +1124,7 @@ private fun LoginScreen(vm: MobileViewModel, onAuthorize: () -> Unit, onPreview:
                 }
                 if (onPreview != null) {
                     OutlinedButton(onClick = onPreview, modifier = Modifier.fillMaxWidth()) {
-                        Text("Probar diseño")
+                        Text(previewLabel)
                     }
                 }
             }

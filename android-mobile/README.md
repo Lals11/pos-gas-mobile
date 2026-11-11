@@ -2,6 +2,8 @@
 
 App en Kotlin y Jetpack Compose para tablet, conectada a Facturación mediante Apps Script.
 
+Para retomar la integración, consulta el [contrato y los pasos de publicación de la API](https://github.com/Lals11/POS-GYA-API/blob/main/CONTRATO_ANDROID.md). El APK conectado necesita el ID del **Ejecutable de API** que se publique desde el proyecto de Facturación.
+
 ## Probar en Android Studio
 
 1. Abre la carpeta `android-mobile` como proyecto y espera la sincronización de Gradle. Si Studio solicita el SDK, instala **Android 14 (API 34)** y usa el JDK integrado de Android Studio.

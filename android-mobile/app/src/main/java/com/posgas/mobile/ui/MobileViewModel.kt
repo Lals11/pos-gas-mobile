@@ -12,9 +12,11 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
 import java.text.Normalizer
 import java.text.ParsePosition
 import java.text.SimpleDateFormat
+import java.util.Calendar
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
@@ -58,7 +60,9 @@ data class AccountMovement(
     val currency: String,
     val reference: String,
     val note: String,
-    val status: String
+    val status: String,
+    val day: Int?,
+    val amountCordobas: Double
 )
 
 data class InventoryItem(
@@ -287,14 +291,23 @@ class MobileViewModel(private val api: ApiClient, private val cache: MobileCache
             try {
                 val data = withContext(Dispatchers.IO) { api.accountData(account, month, year) }
                 updateBalances(data)
+                val bankAccount = account == "Banco"
                 accountMovements = data.rows("movements").map {
                     val rawDate = it.text("FechaHora")
                     val date = parseAccountMovementDate(rawDate)
+                    val originalCurrency = it.text("Moneda_origen").ifBlank { "C$" }
+                    val amount = when {
+                        !bankAccount -> it.number("Monto_origen")
+                        originalCurrency == "C$" -> it.number("Monto_C", "Monto_origen")
+                        else -> it.number("Monto_C")
+                    }
                     AccountMovement(
                         date?.let(::formatAccountMovementDate) ?: rawDate,
                         it.text("Tipo_tx"), it.text("Operacion").equals("CREDITO", true),
-                        it.number("Monto_origen"), it.text("Moneda_origen").ifBlank { "C$" },
-                        it.text("ID_transferencia", "ID_venta"), it.text("Motivo"), it.text("Estado")
+                        amount, if (bankAccount) "C$" else originalCurrency,
+                        it.text("ID_transferencia", "ID_venta"), it.text("Motivo"), it.text("Estado"),
+                        date?.let { Calendar.getInstance(accountTimeZone).apply { time = it }.get(Calendar.DAY_OF_MONTH) },
+                        if (originalCurrency == "C$") it.number("Monto_C", "Monto_origen") else it.number("Monto_C")
                     )
                 }
             } catch (cancelled: CancellationException) {
@@ -421,6 +434,7 @@ class MobileViewModel(private val api: ApiClient, private val cache: MobileCache
         kind: String,
         destination: String,
         amount: Double,
+        currency: String,
         note: String,
         denoms: Map<Int, Int>,
         requestId: String,
@@ -432,11 +446,16 @@ class MobileViewModel(private val api: ApiClient, private val cache: MobileCache
         viewModelScope.launch {
             runCatching {
                 withContext(Dispatchers.IO) {
-                    api.recordAccountMovement(mapOf(
-                        "cuenta" to account, "tipo" to kind, "destino" to destination,
-                        "monto_c" to amount, "nota" to note, "denoms" to denoms.mapKeys { it.key.toString() },
-                        "request_id" to requestId
-                    ))
+                    api.recordAccountMovement(buildMap {
+                        put("cuenta", account)
+                        put("tipo", kind)
+                        put("destino", destination)
+                        put("moneda", currency)
+                        put(if (currency == "USD") "monto" else "monto_c", amount)
+                        put("nota", note)
+                        put("denoms", denoms.mapKeys { it.key.toString() })
+                        put("request_id", requestId)
+                    })
                 }
             }.onSuccess {
                 loadAccounts()
@@ -496,9 +515,13 @@ class MobileViewModel(private val api: ApiClient, private val cache: MobileCache
     }
 
     fun selectInvoiceAccount(account: String) {
+        val changesCurrency = account == "Banco" && form.currency == "USD"
         form = form.copy(
             sourceFunds = account, payer = "Grano y Alma",
             paymentMethod = if (account == "Banco") "Transferencia" else "Efectivo",
+            currency = if (changesCurrency) "C$" else form.currency,
+            amount = if (changesCurrency) "" else form.amount,
+            egresoCordobas = if (changesCurrency) "" else form.egresoCordobas,
             cashDetail = emptyMap()
         )
     }
@@ -776,6 +799,7 @@ class MobileViewModel(private val api: ApiClient, private val cache: MobileCache
                                 "proveedor" to invoice.supplier,
                                 "numero_factura" to invoice.number,
                                 "monto_total" to invoice.amount,
+                                "moneda" to invoice.currency,
                                 "concepto" to invoice.concept,
                                 "comentario" to invoice.notes,
                                 "establecimiento" to invoice.establishment,
@@ -830,6 +854,7 @@ fun Invoice.amountInCordobas(rate: Double = 36.15): Double {
 }
 
 private fun invoiceFromApi(row: Map<String, Any?>): Invoice {
+    val cashDetail = row.text("caja_detalle", "Caja detalle")
     return Invoice(
         id = row.text("id_factura", "id"),
         number = row.text("numero_factura", "numero", "Numeor de factura"),
@@ -844,10 +869,10 @@ private fun invoiceFromApi(row: Map<String, Any?>): Invoice {
         category = row.text("categoria", "Categoria", "categoría"),
         status = row.text("estado", "Estado").ifBlank { "Activa" },
         notes = row.text("comentario", "Comentario", "notas"),
-        cashDetail = parseCashDetail(row.text("caja_detalle", "Caja detalle")),
+        cashDetail = parseCashDetail(cashDetail),
         sourceFunds = row.text("fuente_fondos", "Fuente de fondos"),
         egresoCordobas = row.number("egreso_c", "Egreso (C$)"),
-        rate = 36.15,
+        rate = runCatching { JSONObject(cashDetail).optDouble("tasa", 36.15) }.getOrDefault(36.15),
         registeredBy = row.text("registrado_por", "Registrado por", "creado_por"),
         referenceFund = row.text("referencia_fondo", "Referencia fondo")
     )
@@ -957,7 +982,7 @@ private fun parseCashDetail(raw: String): Map<Int, Int> {
 }
 
 private fun Invoice.cashDetailJson(): String {
-    if (cashDetail.isEmpty()) return ""
+    if (cashDetail.isEmpty() && currency != "USD") return ""
     val denoms = cashDetail
         .filterValues { it > 0 }
         .entries

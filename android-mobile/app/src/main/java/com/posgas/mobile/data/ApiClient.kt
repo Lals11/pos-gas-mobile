@@ -63,7 +63,11 @@ class ApiClient(private val deploymentId: String) {
         execute(mapOf("action" to "mobile_account_movement", "data" to data))
 
     fun createAccountInvoice(data: Map<String, Any?>, requestId: String) =
-        execute(mapOf("action" to "mobile_account_invoice", "request_id" to requestId, "data" to data))
+        execute(mapOf(
+            "action" to if (data["moneda"] == "USD") "mobile_account_invoice_usd" else "mobile_account_invoice",
+            "request_id" to requestId,
+            "data" to data
+        ))
 
     fun searchProducts(search: String, offset: Int) =
         query(mapOf("entity" to "productos", "q" to search, "limit" to 25, "offset" to offset))
