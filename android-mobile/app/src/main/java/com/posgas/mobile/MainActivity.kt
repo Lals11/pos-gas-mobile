@@ -2,6 +2,7 @@ package com.posgas.mobile
 
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
@@ -176,7 +177,12 @@ private fun PosGasApp(vm: MobileViewModel, onAuthorize: () -> Unit) {
 
     MaterialTheme(colorScheme = colors) {
         if (vm.currentUser == null) {
-            LoginScreen(vm, onAuthorize)
+            var preview by rememberSaveable { mutableStateOf(false) }
+            if (BuildConfig.DEBUG && preview) {
+                AccountsDesignPreview(onBack = { preview = false })
+            } else {
+                LoginScreen(vm, onAuthorize, onPreview = if (BuildConfig.DEBUG) ({ preview = true }) else null)
+            }
             return@MaterialTheme
         }
 
@@ -835,7 +841,48 @@ private fun AccountActionButton(
 }
 
 @Composable
-private fun LoginScreen(vm: MobileViewModel, onAuthorize: () -> Unit) {
+private fun AccountsDesignPreview(onBack: () -> Unit) {
+    var expandedAccount by rememberSaveable { mutableStateOf<String?>(null) }
+    var selectedAction by rememberSaveable { mutableStateOf<String?>(null) }
+    val sampleBalances = remember {
+        mapOf(
+            "Banco" to AccountBalance(24500.0, 150.0),
+            "Caja chica" to AccountBalance(1350.0, 0.0),
+            "Caja" to AccountBalance(4260.0, 20.0)
+        )
+    }
+    BackHandler(onBack = onBack)
+    LazyColumn(
+        modifier = Modifier.fillMaxSize().background(Bg),
+        contentPadding = PaddingValues(12.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        item {
+            TextButton(onClick = onBack) { Text("Volver al inicio") }
+            Text("Cuentas", style = MaterialTheme.typography.titleLarge, color = TextMain)
+            Text("Vista de prueba · Saldos de ejemplo", color = Brand)
+        }
+        items(Accounts, key = { it }) { account ->
+            AccountCard(
+                account = account,
+                balance = sampleBalances.getValue(account),
+                expanded = expandedAccount == account,
+                selectedAction = selectedAction.takeIf { expandedAccount == account },
+                onToggle = {
+                    expandedAccount = if (expandedAccount == account) null else account
+                    selectedAction = null
+                },
+                onAction = { selectedAction = it }
+            )
+        }
+        if (selectedAction != null) {
+            item { Text("$selectedAction · $expandedAccount. Conecta tu cuenta para usar esta opción.", color = TextSoft) }
+        }
+    }
+}
+
+@Composable
+private fun LoginScreen(vm: MobileViewModel, onAuthorize: () -> Unit, onPreview: (() -> Unit)?) {
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -855,6 +902,11 @@ private fun LoginScreen(vm: MobileViewModel, onAuthorize: () -> Unit) {
                 vm.authorizationError?.let { Text(it, color = Brand) }
                 Button(onClick = onAuthorize, enabled = vm.apiReady && !vm.authorizing, modifier = Modifier.fillMaxWidth()) {
                     Text(if (vm.authorizing) "Verificando…" else "Continuar con Google")
+                }
+                if (onPreview != null) {
+                    OutlinedButton(onClick = onPreview, modifier = Modifier.fillMaxWidth()) {
+                        Text("Probar diseño")
+                    }
                 }
             }
         }
